@@ -16,11 +16,78 @@ This note compares that answer with **what this repo already knows and ships**.
 | Tree-sitter injection alone starts vtsls on islands | **False** — injection ≈ highlight; LSP still bound to buffer language |
 | Pair `httpyac-lsp` + `vtsls` on HTTP | **Harmful** — vtsls errors on `GET`/headers; we already saw empty-completion / noise |
 | httpyac-lsp must be a Zed extension | **True** — we already are (`extension.toml` + WASI host) |
-| Best “true vtsls in script” long-term = proxy inside httpyac-lsp | **Architecturally sound**, **not implemented**, non-trivial |
-| Two-buffer (`.js` + thin `.http`) | **Supported today** — see [VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md) |
+| Proxy `completion` to a **child** `vtsls --stdio` | **Not** “using Zed’s vtsls” — only **hands off some** methods (see below) |
+| Two-buffer (`.js` + thin `.http`) | **Supported today** — this *is* full Zed-managed vtsls on real JS |
 | Curated / `.script` tips inside `.http` | **Supported today** — see [SCRIPT-EXT.md](./SCRIPT-EXT.md) |
 
 **Do not** put `"vtsls"` next to `"httpyac-lsp"` under `languages.HTTP`.
+
+---
+
+## Critical distinction: Zed’s vtsls vs proxy hand-off
+
+The AI snippet looks like “script uses vtsls”:
+
+```rust
+if self.is_inside_script_block(...) {
+    vtsls_params...uri = self.get_virtual_ts_uri(uri);
+    let vtsls_res = self.vtsls_client.call("textDocument/completion", ...).await?;
+    return Ok(Some(corrected_res));
+}
+```
+
+That is **not** integrating **Zed’s** vtsls. It is:
+
+| | **Zed-managed vtsls** | **httpyac-lsp child proxy** |
+|--|----------------------|------------------------------|
+| Who starts the process | **Zed** (extension / built-in TS stack) | **httpyac-lsp** (`Command::new("vtsls")`) |
+| Who owns lifecycle / restart | Zed | We do |
+| Settings | `lsp.vtsls` in Zed settings | Separate; easy to diverge |
+| Workspace / multi-file | Real project buffers Zed already opened | Virtual URI + only what we `didOpen` |
+| Methods | Full LSP surface Zed wires (complete, hover, def, refs, rename, code action, semantic tokens, …) | **Only what we forward** — snippet usually only `completion` |
+| Buffer language | Real **JavaScript/TypeScript** | Still **HTTP**; Zed never talks to vtsls for this file |
+| Diagnostics / UI | First-class in editor | Optional, must re-map and re-publish ourselves |
+
+So the proxy is accurately described as:
+
+> **把部分能力交出去** — hand a *subset* of IntelliSense to a *private* vtsls instance, then translate ranges back.
+
+It is **not**:
+
+> 完整使用 Zed 里的 vtsls（编辑器级、全协议、与 JS 项目同一套配置）.
+
+### What “部分” usually means in practice
+
+Forwarded (if we invest):
+
+- `textDocument/completion` (and maybe `completionItem/resolve`)
+- sometimes `hover`, `definition`
+
+Usually **not** free with the toy snippet:
+
+- project-wide references / rename  
+- code actions, organize imports  
+- semantic tokens, inlay hints  
+- signature help parity  
+- diagnostics as Zed would show for a real `.ts` tab  
+- Zed’s vtsls init options, plugins, yarn PNP, etc.  
+- httpyac globals (`request` / `response` / `client` / `exports`) without our ambient stubs  
+
+Even a “complete” proxy is still a **second** language service, not the same process Zed uses for `auth-sign.js`.
+
+### What *is* full Zed vtsls today
+
+**Strategy A (two-buffer)** only:
+
+```text
+Open examples/scripts/auth-sign.js
+  → buffer language JavaScript
+  → Zed starts/attaches its real vtsls
+  → full protocol, full settings, real node_modules
+```
+
+That is the only path in this repo that **完整使用 Zed 的 vtsls**.  
+`.http` keeps httpyac-lsp (Host / vars / thin `require`).
 
 ---
 
@@ -71,42 +138,38 @@ foo.http      ──httpyac-lsp──►  Host / {{var}} / thin glue
 - Docs: [SCRIPT-EXT.md](./SCRIPT-EXT.md)  
 - **Not** full TypeScript / every Node prototype — by design.
 
-### C. httpyac-lsp as vtsls **proxy** (AI “ultimate” path — design only)
+### C. httpyac-lsp **child proxy** (partial hand-off — design only, not “Zed vtsls”)
 
 ```text
-Zed  ──all .http LSP──►  httpyac-lsp  ──script ranges only──►  vtsls --stdio
-                              │
-                              └── GET/headers/{{var}} handled locally
+Zed  ──only talks to──►  httpyac-lsp  ──optional subset──►  private vtsls child
+         (HTTP buffer)         │              (completion/… only)
+                               └── GET / headers / {{var}} / catalog locally
 ```
 
-**Why the AI is right that this can work:**
+**Correct framing:** export/delegate *some* script IntelliSense to an embedded
+language service. **Incorrect framing:** “script 块用上了 Zed 的 vtsls”.
 
-- One LSP id for Zed → no dual-server merge bugs on HTTP.  
-- Virtual doc (`*.http` → synthetic `.ts` / padded lines) keeps positions mappable.  
-- vtsls never sees bare `GET` lines → no red-squiggle storm.
+**Why it can still be useful (limited):**
 
-**Why we have not done it (and should treat as a project, not a weekend):**
+- Zed only sees one HTTP LSP → no dual-server merge on `GET`.  
+- Child never parses raw HTTP lines → no TS errors on request lines.  
+- Virtual doc + range map can make **completions** feel “smarter than catalog”.
 
-| Hard part | Detail |
-|-----------|--------|
-| Process | Spawn/manage `vtsls` (or tsserver) lifecycle, crash restart, multi-workspace |
-| Protocol | Full client: `initialize`, `didOpen`/`didChange`, request id correlation, cancellation |
-| Mapping | Multi-script islands, offsets, UTF-16 positions (we already hardened our own) |
-| Semantics | httpyac globals (`request`, `response`, `client`, `exports`) are **not** Node — need stubs/`jsconfig` ambient for vtsls |
-| WASI host | Extension host is WASI; **LSP binary is native** (ok), but packaging/docs for “user must have vtsls on PATH” |
-| UX | Latency, when to forward, merge with our own catalog tips |
-| Fallback | vtsls missing → degrade to catalog (current behavior) |
+**Why it is incomplete by construction:**
 
-Rough phases if we implement on this branch later:
+- Not Zed’s process, settings, or buffer association.  
+- Only methods we implement (toy code = completion only).  
+- Virtual files ≠ real multi-file TS project as the user edits `.js` tabs.  
+- Always a maintenance tax next to catalog (B) and two-buffer (A).
 
-1. **Detect** cursor in script / handler range (parser already knows blocks).  
-2. **Virtual buffer** sync: extract scripts → one or N virtual `.ts` docs.  
-3. **JSON-RPC client** to child `vtsls --stdio` (tower client or hand-rolled framing).  
-4. **Forward** completion/hover/definition only; keep diagnostics optional/filtered.  
-5. **Ambient** `request`/`response`/`client` typings so vtsls is useful, not angry.  
-6. **Settings** flag: `lsp.httpyac-lsp.settings.vtslsProxy: true` default off until solid.
+**Engineering cost** (if ever spiked): process lifecycle, full client protocol,
+multi-island map, UTF-16, ambient httpyac types, PATH to `vtsls`, merge/fallback
+with catalog, feature flag default off.
 
-Until then, **A + B** remain the product answer.
+Until Zed has **range-scoped multi-LSP** that attaches **its** vtsls to
+injections, **A** remains the only “完整 Zed vtsls”; **B** remains in-buffer tips;
+**C** is optional R&D for partial in-`{{ }}` TS-like completion — not a substitute
+for opening a real `.js` file.
 
 ---
 
@@ -128,7 +191,8 @@ Until then, **A + B** remain the product answer.
 | Injection → automatic JS completions from vtsls | **No** on Zed today for LSP routing the way described. |
 | Settings multi-LSP is a practical “方案二” for this use case | **We forbid it** for HTTP; empirically breaks tips. |
 | “cmd-, opens settings” as the main fix | Config is necessary for **A**, not a fix for island LSP. |
-| Proxy is “best and straightforward in Rust” | Best *if* you need in-buffer full TS; **cost is high**. |
+| Proxy is “best and straightforward in Rust” | Cost is high; and it is **only partial hand-off**, not full Zed vtsls. |
+| Snippet `call("textDocument/completion")` = 用上 vtsls | = **交出去一部分** completion；hover/def/project 仍缺除非继续堆转发. |
 
 ### Already better than the AI’s “方案二”
 
@@ -149,7 +213,12 @@ Our docs and `injections.scm` encode the failed experiment:
 | **Spike proxy** | Prototype child vtsls + one completion path behind a flag; measure latency and ambient types. |
 | **Wait for Zed islands** | Watch embedded multi-LSP issues; re-enable JS injection only if editor routes by range. |
 
-**Recommendation:** keep shipping **A + B**. Treat **C** as optional R&D on `vtsls` if someone needs full TS *inside* `{{ }}` without opening a second file — not a prerequisite for daily httpyac use.
+**Recommendation:** keep shipping **A + B**.
+
+- Want **完整 Zed vtsls** → open real `.js` (A).  
+- Want tips **inside** `.http` without a second process → catalog (B).  
+- Want partial TS-like completion inside `{{ }}` without leaving HTTP → only then
+  consider **C**, and document it as **capability hand-off**, never as “Zed vtsls”.
 
 ---
 
