@@ -1308,15 +1308,25 @@ fn completion_sync(
                             let (insert, is_snippet) =
                                 enrich_insert(&m.name, raw, m.is_method);
                             let (filter_text, label) = member_filter_label(display, &m.name);
+                            // Prefix [httpyac] so users can tell catalog vs child vtsls.
                             let detail = if m.source.contains("builtin")
                                 || m.documentation.contains("builtin_script")
                                 || m.source.ends_with(".js")
                                     && !m.source.contains('/')
                             {
-                                // builtin_script file names are like request.js
-                                format!("builtin/user script — {}", m.detail)
+                                format!("[httpyac] builtin — {}", m.detail)
                             } else {
-                                format!("script — {}", m.detail)
+                                format!("[httpyac] {}", m.detail)
+                            };
+                            let documentation = {
+                                let mut doc = m.documentation.clone();
+                                if !doc.contains("[httpyac]") {
+                                    doc = format!(
+                                        "[httpyac catalog] {doc}\n\nSource: {}",
+                                        m.source
+                                    );
+                                }
+                                doc
                             };
                             items.push(CompletionItem {
                                 label,
@@ -1347,9 +1357,7 @@ fn completion_sync(
                                 },
                                 filter_text: Some(filter_text),
                                 sort_text: Some(format!("{sort_prefix}{}", m.name)),
-                                documentation: Some(Documentation::String(
-                                    m.documentation.clone(),
-                                )),
+                                documentation: Some(Documentation::String(documentation)),
                                 commit_characters: if !m.is_method {
                                     Some(vec![".".to_string()])
                                 } else {

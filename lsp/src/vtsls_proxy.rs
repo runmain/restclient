@@ -593,14 +593,8 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
             .filter_map(|v| serde_json::from_value::<CompletionItem>(v.clone()).ok())
             .map(|mut it| {
                 fix_completion_item_ranges(&mut it, preamble);
-                // Mark source for debugging / sort
-                if it.detail.is_none() {
-                    it.detail = Some("vtsls".into());
-                } else if let Some(d) = it.detail.as_mut() {
-                    if !d.contains("vtsls") {
-                        *d = format!("{d} · vtsls");
-                    }
-                }
+                // Mark source so UI shows this came from child vtsls, not catalog.
+                tag_vtsls_origin(&mut it);
                 if it.sort_text.is_none() {
                     it.sort_text = Some(format!("0{}", it.label));
                 }
@@ -616,9 +610,7 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
     if let Ok(mut list) = serde_json::from_value::<CompletionList>(raw) {
         for it in &mut list.items {
             fix_completion_item_ranges(it, preamble);
-            if it.detail.is_none() {
-                it.detail = Some("vtsls".into());
-            }
+            tag_vtsls_origin(it);
         }
         if list.items.is_empty() {
             return None;
@@ -626,6 +618,40 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
         return Some(CompletionResponse::List(list));
     }
     None
+}
+
+fn tag_vtsls_origin(item: &mut CompletionItem) {
+    match item.detail.as_mut() {
+        None => item.detail = Some("[vtsls]".into()),
+        Some(d) if d.contains("[vtsls]") || d.contains("vtsls") => {}
+        Some(d) => *d = format!("[vtsls] {d}"),
+    }
+    // Documentation sidebar (when Zed shows it)
+    match &mut item.documentation {
+        None => {
+            item.documentation = Some(Documentation::String(
+                "[vtsls] via httpyac-lsp child process (@vtsls/language-server)".into(),
+            ));
+        }
+        Some(Documentation::String(s)) => {
+            if !s.contains("[vtsls]") {
+                *s = format!("[vtsls] {s}");
+            }
+        }
+        Some(Documentation::MarkupContent(m)) => {
+            if !m.value.contains("[vtsls]") {
+                m.value = format!("[vtsls] {}", m.value);
+            }
+        }
+    }
+    // Drop private vtsls cache commands Zed cannot run
+    if item
+        .command
+        .as_ref()
+        .is_some_and(|c| c.command.starts_with("_vtsls."))
+    {
+        item.command = None;
+    }
 }
 
 fn fix_completion_item_ranges(item: &mut CompletionItem, preamble: u32) {
