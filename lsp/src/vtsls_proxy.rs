@@ -340,15 +340,16 @@ fn which_ok(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Line-aligned virtual TS: preamble + one output line per HTTP line.
-/// Script interior keeps source text; fences / HTTP lines become blank.
+/// Line-aligned **plain JavaScript** (one output line per HTTP line).
+///
+/// No TypeScript `declare` preamble — that broke parity with real `.js` buffers
+/// (`auth-sign.js`). httpyac globals live in `httpyac-vtsls-globals.d.ts`; Node
+/// APIs come from `@types/node` via jsconfig (same as opening a real JS file).
+///
+/// Returns `(js_text, preamble_lines)` where `preamble_lines` is **0** so LSP
+/// positions map 1:1 with the `.http` buffer.
 pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
-    let preamble_lines = AMBIENT_PREAMBLE.lines().count() as u32;
-    let mut out = String::from(AMBIENT_PREAMBLE);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-
+    let mut out = String::new();
     let mut in_mustache = false; // {{ … }}
     let mut in_percent = false; // {% … %}
 
@@ -356,12 +357,10 @@ pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
         let trim = line.trim();
         let mut emit = String::new();
 
-        // Toggle / single-line percent handlers: > {% … %}  or < {% … %}
         if trim.contains("{%") {
             in_percent = true;
         }
         if trim.contains("%}") {
-            // content before %} on same line is rare; treat whole fence line as non-JS
             if in_percent {
                 in_percent = false;
                 out.push('\n');
@@ -369,28 +368,23 @@ pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
             }
         }
 
-        if trim == "{{" || trim.starts_with("{{") && trim.ends_with("}}") && trim.len() > 4 {
-            // single-line {{ code }}
+        if trim == "{{" || (trim.starts_with("{{") && trim.ends_with("}}") && trim.len() > 4) {
             if trim.starts_with("{{") && trim.ends_with("}}") && !trim[2..].contains("{{") {
                 let inner = trim.trim_start_matches("{{").trim_end_matches("}}").trim();
                 emit = inner.to_string();
-            } else if trim == "{{" || trim.starts_with("{{") && !trim.contains("}}") {
+            } else if trim == "{{" || (trim.starts_with("{{") && !trim.contains("}}")) {
                 in_mustache = true;
             }
         } else if trim == "}}" || (trim.ends_with("}}") && in_mustache) {
             in_mustache = false;
         } else if in_mustache || in_percent {
-            // Strip leading `>` from handler lines inside block
             let body = line.strip_prefix('>').unwrap_or(line);
             let body = body.strip_prefix('<').unwrap_or(body);
             emit = body.to_string();
-            // Drop pure fence leftovers
-            if emit.trim() == "{%" || emit.trim() == "%}" || emit.trim() == "{{" || emit.trim() == "}}"
-            {
+            if matches!(emit.trim(), "{%" | "%}" | "{{" | "}}") {
                 emit.clear();
             }
         } else if looks_like_inline_script_line(trim) {
-            // Loose JS signals outside formal blocks (same as completions heuristic)
             emit = line.to_string();
         }
 
@@ -398,7 +392,7 @@ pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
         out.push('\n');
     }
 
-    (out, preamble_lines)
+    (out, 0)
 }
 
 fn looks_like_inline_script_line(trim: &str) -> bool {
@@ -632,13 +626,14 @@ impl VtslsProxy {
             pending,
             next_id: AtomicU64::new(1),
             versions: Mutex::new(HashMap::new()),
-            preamble_lines: AMBIENT_PREAMBLE.lines().count() as u32,
+            // Line-aligned plain JS shadow → positions match .http 1:1 (no TS preamble).
+            preamble_lines: 0,
             command_path: command.to_string(),
         };
 
         proxy.initialize(workspace_root).await?;
         // Brief settle so tsserver project service can start
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         Ok(proxy)
     }
 
@@ -739,7 +734,8 @@ impl VtslsProxy {
     /// Sync script islands into a **real on-disk `.js` shadow file** (same layout as
     /// opening `auth-sign.js` under jsconfig + `@types/node`), then tell vtsls.
     pub async fn sync_document(&self, http_uri: &Url, http_text: &str) -> Result<(), String> {
-        let (virtual_text, _preamble) = build_virtual_typescript(http_text);
+        let (virtual_text, preamble) = build_virtual_typescript(http_text);
+        debug_assert_eq!(preamble, 0, "shadow JS must stay line-aligned with .http");
 
         // Materialize beside the .http file so require()/jsconfig match real JS buffers.
         if let Some(shadow) = shadow_js_path(http_uri) {
@@ -795,8 +791,7 @@ impl VtslsProxy {
                     }),
                 )
                 .await;
-            // Give tsserver a moment after reload
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
             self.notify(
                 "textDocument/didChange",
@@ -1349,13 +1344,13 @@ GET https://example.com
 Host: x
 "#;
         let (virt, preamble) = build_virtual_typescript(src);
-        assert!(preamble > 5);
-        // HTTP line count == non-preamble virtual lines
+        assert_eq!(preamble, 0, "plain JS shadow is 1:1 with .http lines");
         let http_lines = src.lines().count();
-        let virt_body_lines = virt.lines().count() - preamble as usize;
-        assert_eq!(virt_body_lines, http_lines);
+        assert_eq!(virt.lines().count(), http_lines);
         assert!(virt.contains("createHmac"));
         assert!(!virt.contains("GET https://"));
+        // Must stay plain JS (no TS declare) — same as auth-sign.js
+        assert!(!virt.contains("declare const"));
     }
 
     #[test]
@@ -1500,6 +1495,45 @@ POST https://example.com
                 l.contains("createHmac") || l.contains("createHash") || l.contains("randomBytes")
             }),
             "expected Node crypto members like auth-sign.js, got {labels:?}"
+        );
+    }
+
+    /// Parity with auth-sign.js: after require destructure, typing `signRe` → signRequest.
+    #[tokio::test]
+    async fn live_signre_from_require_like_js() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+        let http = r#"### Signed
+{{
+  const { signRequest } = require('./scripts/auth-sign.js');
+  signRe
+}}
+"#;
+        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        proxy.sync_document(&uri, http).await.expect("sync");
+        let shadow = shadow_js_path(&uri).unwrap();
+        eprintln!("shadow exists={} path={}", shadow.is_file(), shadow.display());
+        eprintln!("shadow head:\n{}", fs::read_to_string(&shadow).unwrap().chars().take(500).collect::<String>());
+        let line = http.lines().position(|l| l.contains("signRe")).unwrap() as u32;
+        let col = http.lines().nth(line as usize).unwrap().len() as u32;
+        let pos = Position { line, character: col };
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let res = proxy.completion(&uri, pos, None).await.expect("completion");
+        let labels: Vec<String> = match res {
+            Some(CompletionResponse::Array(i)) => i.into_iter().map(|x| x.label).collect(),
+            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|x| x.label).collect(),
+            None => vec![],
+        };
+        eprintln!("n={} labels(prefix sign)={:?}", labels.len(), labels.iter().filter(|l| l.to_lowercase().contains("sign")).collect::<Vec<_>>());
+        assert!(
+            labels.iter().any(|l| l.contains("signRequest")),
+            "like auth-sign.js, signRe must complete to signRequest; got {labels:?}"
         );
     }
 
