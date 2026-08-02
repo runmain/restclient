@@ -15,6 +15,7 @@
 //! - `useBuiltinScriptCompletions: false` / `scriptCompletionSource: "vtsls"` → child vtsls only
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -423,12 +424,131 @@ pub fn virtual_pos_to_http(pos: Position, preamble_lines: u32) -> Position {
     }
 }
 
+/// Shadow `.js` path beside the `.http` file — same folder so `require('./scripts/…')`
+/// and `jsconfig.json` / `@types/node` resolve **exactly like** opening `auth-sign.js`.
+/// Example: `examples/environments.http` → `examples/environments.http.__vtsls__.js`
+pub fn shadow_js_path(http_uri: &Url) -> Option<PathBuf> {
+    let p = http_uri.to_file_path().ok()?;
+    let mut s = p.into_os_string();
+    s.push(".__vtsls__.js");
+    Some(PathBuf::from(s))
+}
+
 fn virtual_uri_for(http_uri: &Url) -> Url {
+    if let Some(path) = shadow_js_path(http_uri) {
+        if let Ok(u) = Url::from_file_path(&path) {
+            return u;
+        }
+    }
+    // Fallback (non-file URIs): synthetic — weaker IntelliSense
     let s = http_uri.as_str();
-    if s.ends_with(".httpyac.ts") {
+    if s.ends_with(".__vtsls__.js") {
         return http_uri.clone();
     }
-    Url::parse(&format!("{s}.httpyac.ts")).unwrap_or_else(|_| http_uri.clone())
+    Url::parse(&format!("{s}.__vtsls__.js")).unwrap_or_else(|_| http_uri.clone())
+}
+
+/// Ensure a `jsconfig.json` next to the HTTP file so tsserver treats the shadow
+/// `.js` like `examples/scripts/auth-sign.js` (Node `@types`, checkJs, commonjs).
+fn ensure_jsconfig_for_http_dir(http_dir: &Path) -> Result<(), String> {
+    let jsconfig = http_dir.join("jsconfig.json");
+    if jsconfig.is_file() {
+        return Ok(());
+    }
+    // Prefer workspace / ATA @types/node so require('crypto') == real Node API
+    let mut type_roots: Vec<String> = Vec::new();
+    if http_dir.join("node_modules/@types").is_dir() {
+        type_roots.push("./node_modules/@types".into());
+    }
+    if let Some(parent) = http_dir.parent() {
+        if parent.join("node_modules/@types").is_dir() {
+            type_roots.push("../node_modules/@types".into());
+        }
+    }
+    // TypeScript automatic type acquisition cache (where Zed/tsserver already put @types/node)
+    if let Ok(home) = std::env::var("HOME") {
+        let cache = PathBuf::from(&home).join("Library/Caches/typescript");
+        if let Ok(rd) = std::fs::read_dir(&cache) {
+            for ent in rd.flatten() {
+                let tr = ent.path().join("node_modules/@types");
+                if tr.is_dir() {
+                    type_roots.push(tr.to_string_lossy().to_string());
+                }
+            }
+        }
+        let xdg = PathBuf::from(&home).join(".cache/typescript");
+        if let Ok(rd) = std::fs::read_dir(&xdg) {
+            for ent in rd.flatten() {
+                let tr = ent.path().join("node_modules/@types");
+                if tr.is_dir() {
+                    type_roots.push(tr.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    let mut compiler: serde_json::Map<String, Value> = serde_json::Map::new();
+    compiler.insert("module".into(), json!("commonjs"));
+    compiler.insert("target".into(), json!("ES2020"));
+    compiler.insert("checkJs".into(), json!(true));
+    compiler.insert("strict".into(), json!(false));
+    compiler.insert("noEmit".into(), json!(true));
+    compiler.insert("moduleResolution".into(), json!("node"));
+    compiler.insert("types".into(), json!(["node"]));
+    if !type_roots.is_empty() {
+        compiler.insert("typeRoots".into(), json!(type_roots));
+    }
+
+    let doc = json!({
+        "compilerOptions": compiler,
+        "include": [
+            "./**/*.js",
+            "./**/*.cjs",
+            "./**/*.mjs",
+            "./**/*.__vtsls__.js",
+            "./scripts/**/*.js"
+        ]
+    });
+    // httpyac globals for script islands (request/response/…)
+    let globals = http_dir.join("httpyac-vtsls-globals.d.ts");
+    if !globals.is_file() {
+        let _ = fs::write(
+            &globals,
+            r#"/** Auto-generated for httpyac-lsp child vtsls — httpyac script globals */
+declare const request: {
+  method: string;
+  url: string;
+  headers: Record<string, string> & { set?(k: string, v: string): void; get?(k: string): string };
+  body?: unknown;
+  [key: string]: unknown;
+};
+declare const response: {
+  statusCode: number;
+  status: number;
+  headers: Record<string, string>;
+  body: string | unknown;
+  parsedBody?: unknown;
+  [key: string]: unknown;
+};
+declare const client: {
+  test(name: string, fn: () => void): void;
+  assert(cond: unknown, message?: string): void;
+  log(...args: unknown[]): void;
+  global: { get(k: string): unknown; set(k: string, v: unknown): void; clear(k?: string): void };
+  [key: string]: unknown;
+};
+declare const exports: Record<string, unknown>;
+declare function test(name: string, fn: () => void): void;
+"#,
+        );
+    }
+
+    fs::write(
+        &jsconfig,
+        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| format!("write jsconfig.json: {e}"))?;
+    Ok(())
 }
 
 struct Pending {
@@ -616,10 +736,23 @@ impl VtslsProxy {
         }
     }
 
-    /// Sync virtual TS document for an open `.http` buffer.
+    /// Sync script islands into a **real on-disk `.js` shadow file** (same layout as
+    /// opening `auth-sign.js` under jsconfig + `@types/node`), then tell vtsls.
     pub async fn sync_document(&self, http_uri: &Url, http_text: &str) -> Result<(), String> {
-        let (virtual_text, preamble) = build_virtual_typescript(http_text);
-        let _ = preamble; // stored on struct from ambient constant
+        let (virtual_text, _preamble) = build_virtual_typescript(http_text);
+
+        // Materialize beside the .http file so require()/jsconfig match real JS buffers.
+        if let Some(shadow) = shadow_js_path(http_uri) {
+            if let Some(dir) = shadow.parent() {
+                let _ = ensure_jsconfig_for_http_dir(dir);
+            }
+            if let Some(parent) = shadow.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&shadow, &virtual_text)
+                .map_err(|e| format!("write shadow {}: {e}", shadow.display()))?;
+        }
+
         let vuri = virtual_uri_for(http_uri);
         let key = vuri.to_string();
         let mut versions = self.versions.lock().await;
@@ -629,19 +762,41 @@ impl VtslsProxy {
         let version = *ver;
         drop(versions);
 
+        // javascript — same languageId Zed uses for auth-sign.js
         if is_new {
             self.notify(
                 "textDocument/didOpen",
                 json!({
                     "textDocument": {
                         "uri": vuri,
-                        "languageId": "typescript",
+                        "languageId": "javascript",
                         "version": version,
                         "text": virtual_text,
                     }
                 }),
             )
             .await?;
+            // Pick up newly written jsconfig.json / @types/node
+            let _ = self
+                .request(
+                    "workspace/executeCommand",
+                    json!({
+                        "command": "typescript.reloadProjects",
+                        "arguments": []
+                    }),
+                )
+                .await;
+            let _ = self
+                .request(
+                    "workspace/executeCommand",
+                    json!({
+                        "command": "javascript.reloadProjects",
+                        "arguments": []
+                    }),
+                )
+                .await;
+            // Give tsserver a moment after reload
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         } else {
             self.notify(
                 "textDocument/didChange",
@@ -663,11 +818,15 @@ impl VtslsProxy {
             return Ok(());
         }
         drop(versions);
-        self.notify(
-            "textDocument/didClose",
-            json!({ "textDocument": { "uri": vuri } }),
-        )
-        .await
+        let _ = self
+            .notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": vuri } }),
+            )
+            .await;
+        // Keep shadow on disk for debugging; gitignored. Uncomment to delete:
+        // if let Some(p) = shadow_js_path(http_uri) { let _ = fs::remove_file(p); }
+        Ok(())
     }
 
     pub async fn completion(
@@ -909,25 +1068,68 @@ fn json_id_as_u64(id: &Value) -> Option<u64> {
 fn server_request_result(method: &str, params: &Value) -> Value {
     match method {
         "workspace/configuration" => {
-            // One result object per ConfigurationItem
+            // Mirror settings that make real .js buffers (auth-sign.js) useful.
             let n = params
                 .get("items")
                 .and_then(|i| i.as_array())
                 .map(|a| a.len())
                 .unwrap_or(1);
-            let empty = json!({
+            let cfg = json!({
                 "typescript": {
-                    "suggest": { "enabled": true },
-                    "tsserver": { "useSyntaxServer": "auto" }
+                    "suggest": { "enabled": true, "paths": true, "autoImports": true },
+                    "tsserver": { "useSyntaxServer": "auto" },
+                    "preferences": { "includePackageJsonAutoImports": "on" },
+                    "disableAutomaticTypeAcquisition": false
                 },
                 "javascript": {
-                    "suggest": { "enabled": true }
+                    "suggest": {
+                        "enabled": true,
+                        "paths": true,
+                        "autoImports": true,
+                        "names": true,
+                        "completeFunctionCalls": false
+                    },
+                    "preferences": { "includePackageJsonAutoImports": "on" },
+                    "validate": { "enable": true }
                 },
+                // Implicit project when no jsconfig (backup)
+                "js/ts.implicitProjectConfig.checkJs": true,
+                "js/ts.implicitProjectConfig.module": "CommonJS",
+                "js/ts.implicitProjectConfig.target": "ES2020",
+                "js/ts.implicitProjectConfig.strict": false,
                 "vtsls": {
-                    "enable": true
+                    "experimental": {
+                        "completion": {
+                            "enableServerSideFuzzyMatch": true,
+                            "entriesLimit": 100
+                        }
+                    }
                 }
             });
-            Value::Array(vec![empty; n.max(1)])
+            // Per-item: if client asks for a section, still return full map (vtsls merges).
+            let items = params.get("items").and_then(|i| i.as_array());
+            if let Some(arr) = items {
+                let mut out = Vec::with_capacity(arr.len());
+                for it in arr {
+                    let section = it.get("section").and_then(|s| s.as_str()).unwrap_or("");
+                    if section.is_empty() {
+                        out.push(cfg.clone());
+                    } else if let Some(v) = cfg.pointer(&format!("/{}", section.replace('.', "/"))) {
+                        out.push(v.clone());
+                    } else if section.starts_with("typescript")
+                        || section.starts_with("javascript")
+                        || section.starts_with("vtsls")
+                        || section.starts_with("js/ts")
+                    {
+                        out.push(cfg.clone());
+                    } else {
+                        out.push(cfg.clone());
+                    }
+                }
+                Value::Array(out)
+            } else {
+                Value::Array(vec![cfg; n.max(1)])
+            }
         }
         "workspace/workspaceFolders" => Value::Null,
         "window/workDoneProgress/create" => Value::Null,
@@ -1257,20 +1459,28 @@ mod live_vtsls {
         let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
             .await
             .expect("spawn");
-        let http = r#"###
+        // Real path under examples/ (same folder as scripts/ + jsconfig) — not a fake URI
+        let http = r#"### POST with crypto
 {{
   const crypto = require('crypto');
   crypto.
 }}
+POST https://example.com
 "#;
-        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        let uri = Url::from_file_path(root.join("environments.http")).unwrap();
         proxy.sync_document(&uri, http).await.expect("sync");
-        // 0=### 1={{ 2=const 3=crypto.
+        let shadow = shadow_js_path(&uri).expect("shadow");
+        assert!(shadow.is_file(), "missing shadow {}", shadow.display());
+        let line = http
+            .lines()
+            .position(|l| l.trim().starts_with("crypto."))
+            .expect("crypto. line") as u32;
+        let col = http.lines().nth(line as usize).map(|l| l.len() as u32).unwrap_or(9);
         let pos = Position {
-            line: 3,
-            character: 9,
+            line,
+            character: col,
         };
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         let res = proxy.completion(&uri, pos, None).await.expect("ok");
         let labels: Vec<String> = match res {
             Some(CompletionResponse::Array(items)) => {
@@ -1280,7 +1490,8 @@ mod live_vtsls {
             None => vec![],
         };
         eprintln!(
-            "n={} first40={:?}",
+            "shadow={} n={} first40={:?}",
+            shadow.display(),
             labels.len(),
             &labels[..labels.len().min(40)]
         );
@@ -1288,7 +1499,7 @@ mod live_vtsls {
             labels.iter().any(|l| {
                 l.contains("createHmac") || l.contains("createHash") || l.contains("randomBytes")
             }),
-            "expected Node crypto members, got {labels:?}"
+            "expected Node crypto members like auth-sign.js, got {labels:?}"
         );
     }
 

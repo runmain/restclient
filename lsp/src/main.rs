@@ -826,16 +826,14 @@ impl HttpLsp {
                     }
                 };
                 if vtsls_items.is_empty() {
-                    // Never leave the user with *zero* tips: fall back to catalog.
-                    // (Exclusive mode still prefers vtsls when it returns items.)
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            "vtsls returned no completions — falling back to builtin catalog \
-                             (set useBuiltinScriptCompletions: true to skip vtsls entirely)",
+                            "vtsls returned 0 completion items (check shadow *.__vtsls__.js + jsconfig)",
                         )
                         .await;
-                    return Ok(catalog_resp);
+                    // Still empty — do not silently switch engines; user chose vtsls.
+                    return Ok(None);
                 }
                 Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,

@@ -48,6 +48,12 @@ http-client.private.env.json
 
 # ── Local overrides / send temp (httpyac-run) ───────────
 .httpyac-active-env
+
+# ── httpyac-lsp child vtsls shadow buffers (parity with real .js) ──
+**/*.__vtsls__.js
+**/httpyac-vtsls-globals.d.ts
+# auto-written only when missing; ignore if generated beside .http samples
+examples/jsconfig.json
 .httpyac-run-tmp-*.http
 **/.httpyac-run-tmp-*.http
 # LSP ad-hoc completion test fixtures
