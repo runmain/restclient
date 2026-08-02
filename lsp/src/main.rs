@@ -826,20 +826,16 @@ impl HttpLsp {
                     }
                 };
                 if vtsls_items.is_empty() {
-                    // Hard mutex: do not mix catalog. Soft land only if vtsls process missing.
-                    let has_proxy = self.vtsls.proxy.lock().await.is_some();
-                    if !has_proxy {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                "scriptCompletionSource=vtsls but vtsls unavailable — \
-                                 falling back to builtin catalog for this request. \
-                                 Install @vtsls/language-server or set useBuiltinScriptCompletions: true",
-                            )
-                            .await;
-                        return Ok(catalog_resp);
-                    }
-                    return Ok(None);
+                    // Never leave the user with *zero* tips: fall back to catalog.
+                    // (Exclusive mode still prefers vtsls when it returns items.)
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            "vtsls returned no completions — falling back to builtin catalog \
+                             (set useBuiltinScriptCompletions: true to skip vtsls entirely)",
+                        )
+                        .await;
+                    return Ok(catalog_resp);
                 }
                 Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
