@@ -1,0 +1,52 @@
+### Environment Variables Example
+## Uses http-client.env.json in this folder (keys: dev, prod, staging).
+## activeEnv defaults to "dev".
+##
+## In Zed (▶ menu on the request):
+##   ▶ Send Request              — send with current activeEnv
+##   🌐 Switch Environment       — change activeEnv only (no send)
+##   🌐 Send with Environment…   — pick env, then send
+##   ⊕ Send in New Tab           — send in a new terminal tab
+##
+## CLI:
+##   httpyac-run environments.http 9
+##   httpyac-run environments.http --switch-env
+##   httpyac-run environments.http 9 --env prod
+##   httpyac-run environments.http 9 --pick-env
+
+### GET using base_url from env
+GET {{base_url}}/get
+Accept: application/json
+Host: {{api}}
+
+### GET with api_key from env
+GET {{api_url}}/headers
+X-Api-Key: {{api_key}}
+
+Accept: application/json
+
+### POST with auth_token from env
+{{
+  //pre request script
+  const crypto = require('crypto');
+  const date = new Date();
+  const signatureBase64 = crypto.createHmac('sha256', 'secret')
+  .update(`${request.method}\u2028${request.url}\u2028${date.getTime()}`).digest("base64");
+  exports.authDate = date.toUTCString();
+  exports.authentication = `Basic ${signatureBase64}`;
+}}
+POST {{api_url}}/post
+Authorization: Bearer {{auth_token}}
+Content-Type: application/json
+
+
+{
+  "user": "{{user}}",
+  "message": "Hello from {{base_url}}"
+}
+
+### Mix file variable with env
+@endpoint = /anything
+
+GET {{base_url}}{{endpoint}}
+Authorization: Bearer {{auth_token}}

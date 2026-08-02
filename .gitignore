@@ -1,0 +1,54 @@
+# ── Rust build ──────────────────────────────────────────
+/target/
+/lsp/target/
+**/*.rs.bk
+
+# ── Extension build artifacts ───────────────────────────
+extension.wasm
+*.wasm.d
+# keep grammars/http.wasm in repo (needed for install without tree-sitter rebuild)
+
+# ── Cargo / IDE ─────────────────────────────────────────
+# Cargo.lock for the WASM lib is committed (binary/app-like)
+# lsp/Cargo.lock also useful for reproducible LSP builds — keep it
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+Desktop.ini
+
+# ── Logs / temp ─────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.backup
+*~
+
+# ── Node (if someone runs tree-sitter/npm locally) ──────
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# ── Env / secrets (never commit private env) ────────────
+http-client.private.env.json
+**/*.private.env.json
+.env
+.env.*
+!.env.example
+
+# ── Local overrides / send temp (httpyac-run) ───────────
+.httpyac-active-env
+.httpyac-run-tmp-*.http
+**/.httpyac-run-tmp-*.http
+# LSP ad-hoc completion test fixtures
+examples/_*.http
+
+# ── Install / rustup noise ──────────────────────────────
+.rustc_info.json
+**/target/.rustc_info.json

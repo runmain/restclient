@@ -1,0 +1,27 @@
+id = "httpyacclient"
+name = "HTTPyac Client"
+description = "HTTPyac client for Zed using httpyac CLI - supports variables, env, scripts, request execution"
+version = "0.1.3"
+schema_version = 1
+authors = ["Grok / xAI"]
+repository = "https://github.com/httpyac/zed-httpyacclient"
+languages = ["languages/http"]
+# Snippets work even if LSP fails to start (Host / headers / methods)
+snippets = ["./snippets/http.json"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[grammars.http]
+repository = "https://github.com/rest-nvim/tree-sitter-http"
+rev = "db8b4398de90b6d0b6c780aba96aaa2cd8e9202c"
+
+# `languages` must match `name` in languages/http/config.toml ("HTTP")
+[language_servers.httpyac-lsp]
+name = "HTTPyac LSP"
+languages = ["HTTP"]
+
+[language_servers.httpyac-lsp.language_ids]
+HTTP = "http"

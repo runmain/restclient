@@ -1,0 +1,37 @@
+name = "HTTP"
+grammar = "http"
+path_suffixes = ["http", "rest"]
+line_comment = "# "
+# Bind httpyac-lsp (see extension.toml [language_servers.httpyac-lsp])
+language_servers = ["httpyac-lsp"]
+autoclose_before = ";:.,=}])>"
+# `{` `}` `$` are word chars so the completion *query* for variables is
+# `{{` / `{{b` / `{{base_…` — NOT `Host: {{` or `GET {{` or `"user": "{{`.
+# That mismatch was why bare-line `{{` worked but URL/header/body/script failed
+# (Zed client-filters on query vs filterText/label).
+word_characters = ["-", "_", "{", "}", "$"]
+# Do NOT add `:` or ` ` — they glue the whole header/URL into the query string.
+# Letters: re-query while typing Host / {{base_url
+completion_query_characters = [
+    "-",
+    "_",
+    "/",
+    "{",
+    "}",
+    ".",
+    "@",
+    "$",
+    ">",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+]
+# Do NOT auto-close `{` → `}`: httpyac uses `{{var}}` heavily; auto-close
+# turns the first `{` into `{|}` and breaks mustache completion UX.
+brackets = [
+    { start = "{", end = "}", close = false, newline = false },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+]

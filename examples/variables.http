@@ -1,0 +1,55 @@
+# Variables & Environment
+# File-level @variables must appear BEFORE the first ### request separator
+# so httpyac treats them as file-scoped (not tied to an empty request block).
+#
+# Nested: @baseUrl = https://{{host}} is supported by httpyac.
+
+@host = httpbin.org
+@baseUrl = https://{{host}}
+@contentType = application/json
+@protocol = https
+@domain = api.example.com
+@apiBase = {{protocol}}://{{domain}}
+@version = v2
+@endpoint = {{apiBase}}/{{version}}
+@token = my-secret-bearer-token
+@userId = 42
+
+### GET using variables
+GET {{baseUrl}}/get
+Accept: {{contentType}}
+
+### POST using variables in URL, headers, and body
+POST {{baseUrl}}/post
+Content-Type: {{contentType}}
+
+{
+  "server": "{{host}}",
+  "message": "sent from Zed HTTPyac Client"
+}
+
+### Deeply nested variable
+# Resolves to: https://api.example.com/v2/users
+GET {{endpoint}}/users
+Accept: application/json
+
+### Variable in URL path
+GET {{baseUrl}}/anything/users/{{userId}}
+
+### Variable in header value
+GET {{baseUrl}}/headers
+Authorization: Bearer {{token}}
+
+### Variable in request body
+POST {{baseUrl}}/post
+Content-Type: {{contentType}}
+
+{
+  "user_id": "{{userId}}",
+  "token": "{{token}}"
+}
+
+### Using environment variable (requires http-client.env.json + activeEnv)
+# Uncomment after setting activeEnv / Switch Environment:
+# GET {{api_url}}/get
+# Authorization: Bearer {{api_key}}

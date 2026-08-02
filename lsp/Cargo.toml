@@ -1,0 +1,30 @@
+[workspace]
+
+[package]
+name = "httpyac-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "httpyac_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "httpyac-lsp"
+path = "src/main.rs"
+
+[[bin]]
+name = "httpyac-run"
+path = "src/bin/httpyac_run.rs"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
