@@ -312,11 +312,14 @@ impl VtslsProxy {
         let pending = Arc::new(Mutex::new(Pending {
             map: HashMap::new(),
         }));
+        let stdin = Arc::new(Mutex::new(stdin));
         let pending_r = pending.clone();
+        let stdin_r = stdin.clone();
 
-        // Read stdout loop
+        // Read stdout: complete our requests + **answer server→client requests**
+        // (vtsls blocks on workspace/configuration if we never reply → completion timeout).
         tokio::spawn(async move {
-            if let Err(e) = read_lsp_stdout(stdout, pending_r).await {
+            if let Err(e) = read_lsp_stdout(stdout, pending_r, stdin_r).await {
                 eprintln!("[httpyac-lsp] vtsls reader ended: {e}");
             }
         });
@@ -344,7 +347,7 @@ impl VtslsProxy {
 
         let proxy = Self {
             child,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             pending,
             next_id: AtomicU64::new(1),
             versions: Mutex::new(HashMap::new()),
@@ -353,6 +356,8 @@ impl VtslsProxy {
         };
 
         proxy.initialize(workspace_root).await?;
+        // Brief settle so tsserver project service can start
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         Ok(proxy)
     }
 
@@ -438,14 +443,14 @@ impl VtslsProxy {
         }))
         .await?;
 
-        match tokio::time::timeout(std::time::Duration::from_secs(8), rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err("vtsls response channel closed".into()),
             Err(_) => {
                 let mut p = self.pending.lock().await;
                 p.map.remove(&id);
-                Err("vtsls request timed out".into())
+                Err(format!("vtsls request timed out ({method})"))
             }
         }
     }
@@ -691,9 +696,64 @@ fn remap_goto_definition(
     Ok(None)
 }
 
+async fn write_raw_message(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    body: &Value,
+) -> Result<(), String> {
+    let data = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let header = format!("Content-Length: {}\r\n\r\n", data.len());
+    let mut guard = stdin.lock().await;
+    guard
+        .write_all(header.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    guard.write_all(&data).await.map_err(|e| e.to_string())?;
+    guard.flush().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn json_id_as_u64(id: &Value) -> Option<u64> {
+    id.as_u64()
+        .or_else(|| id.as_i64().map(|i| i as u64))
+        .or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Default replies so vtsls does not block waiting on the client.
+fn server_request_result(method: &str, params: &Value) -> Value {
+    match method {
+        "workspace/configuration" => {
+            // One result object per ConfigurationItem
+            let n = params
+                .get("items")
+                .and_then(|i| i.as_array())
+                .map(|a| a.len())
+                .unwrap_or(1);
+            let empty = json!({
+                "typescript": {
+                    "suggest": { "enabled": true },
+                    "tsserver": { "useSyntaxServer": "auto" }
+                },
+                "javascript": {
+                    "suggest": { "enabled": true }
+                },
+                "vtsls": {
+                    "enable": true
+                }
+            });
+            Value::Array(vec![empty; n.max(1)])
+        }
+        "workspace/workspaceFolders" => Value::Null,
+        "window/workDoneProgress/create" => Value::Null,
+        "client/registerCapability" | "client/unregisterCapability" => Value::Null,
+        "window/showMessageRequest" => Value::Null,
+        _ => Value::Null,
+    }
+}
+
 async fn read_lsp_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<Pending>>,
+    stdin: Arc<Mutex<ChildStdin>>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -724,10 +784,30 @@ async fn read_lsp_stdout(
             .map_err(|e| e.to_string())?;
         let msg: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
 
-        if let Some(id) = msg.get("id") {
-            // response
-            let id_n = id.as_u64().or_else(|| id.as_i64().map(|i| i as u64));
-            if let Some(id_n) = id_n {
+        let has_id = msg.get("id").is_some();
+        let method = msg.get("method").and_then(|m| m.as_str());
+
+        if has_id && method.is_some() {
+            // Server → client **request** — must respond or tsserver stalls.
+            let method = method.unwrap();
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let result = server_request_result(method, &params);
+            let _ = write_raw_message(
+                &stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }),
+            )
+            .await;
+            continue;
+        }
+
+        if has_id && method.is_none() {
+            // Response to **our** request
+            if let Some(id_n) = msg.get("id").and_then(json_id_as_u64) {
                 let mut p = pending.lock().await;
                 if let Some(tx) = p.map.remove(&id_n) {
                     if let Some(err) = msg.get("error") {
@@ -738,8 +818,10 @@ async fn read_lsp_stdout(
                     }
                 }
             }
+            continue;
         }
-        // ignore server → client requests/notifications for now (capabilities minimal)
+
+        // Notifications (publishDiagnostics, logMessage, …) — ignore
     }
 }
 
@@ -895,5 +977,50 @@ Host: x
         let s = VtslsSettings::from_json(&v);
         assert_eq!(s.command.as_deref(), Some("/bin/vtsls"));
         assert!(s.enabled);
+    }
+}
+
+#[cfg(test)]
+mod live_vtsls {
+    use super::*;
+    use tower_lsp::lsp_types::Position;
+
+    #[tokio::test]
+    async fn live_completion_signed_partial() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls on PATH");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+        let http = r#"###
+{{
+  const signed = { authDate: 'x', authentication: 'y' };
+  signe
+}}
+"#;
+        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        proxy.sync_document(&uri, http).await.expect("sync");
+        // position on "signe" — line index: ###=0, {{=1, const=2, signe=3
+        // "  signe" — cursor after the word (col 7)
+        let pos = Position {
+            line: 3,
+            character: 7,
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let res = proxy
+            .completion(&uri, pos, None)
+            .await
+            .expect("completion ok");
+        eprintln!("completion res = {:?}", res);
+        let labels = match res {
+            Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect::<Vec<_>>(),
+            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|i| i.label).collect::<Vec<_>>(),
+            None => vec![],
+        };
+        eprintln!("labels={labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("signed")),
+            "expected signed in {labels:?}"
+        );
     }
 }
