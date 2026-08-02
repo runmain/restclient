@@ -120,8 +120,8 @@ is **not** available inside `.http` today. Zed attaches language servers to the
 | Piece | Role |
 |-------|------|
 | **Tree-sitter injection** (`injections.scm`) | JS/JSON **highlighting** in `> {% %}` / `< {% %}` / bodies |
-| **httpyac-lsp** | `response.` / `client.` / `JSON.` / keywords / `require('…')` module names |
-| **vtsls / tsserver** | Runs on `.js`/`.ts` files — **not** on injected ranges in `.http` |
+| **httpyac-lsp** | httpyac APIs + curated Node (`crypto.` / `fs.` / `.update`/`.digest`) |
+| **vtsls / tsserver** | Only on real `.js`/`.ts` buffers — **not** injection islands in `.http` |
 | **httpyac CLI** | Actually executes the script |
 
 Practical split:
@@ -129,9 +129,13 @@ Practical split:
 | Goal | Where |
 |------|--------|
 | `Host`, `{{base_url}}`, `client.global.set` | **httpyac-lsp** |
-| JS keywords / `JSON.` / `require('crypto')` name | **httpyac-lsp** (curated, not full Node types) |
-| Full `crypto.createHmac` method IntelliSense | Separate `.js` file (or future Zed multi-LSP) |
+| `require('crypto')`, `crypto.createHmac`, `.update`/`.digest` | **httpyac-lsp** (curated Node surface) |
+| Full TS types / every prototype member | **Not in `.http`** (Zed: no range-scoped multi-LSP yet) |
 | Actually run the script | **httpyac CLI** |
+
+### Why not wire real JS LSP onto HTTP?
+
+Zed attaches language servers to the **buffer language**. Injections highlight embedded JS but do not start `vtsls` on those ranges. Listing `vtsls` under `languages.HTTP` would treat the whole `.http` file as TypeScript (noise on `GET`/headers). Vue/Svelte solve this with one multi-language server, not injection+tsserver. Until Zed supports multi-LSP documents, curated **httpyac-lsp** members are the practical path.
 
 ## Related docs
 

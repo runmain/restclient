@@ -137,11 +137,22 @@ pub const BUILTIN_VARS: &[(&str, &str)] = &[
 
 /// Top-level objects in httpyac / response scripts.
 pub const SCRIPT_ROOTS: &[(&str, &str)] = &[
-    ("response", "HTTP response (status, headers, body, parsedBody)"),
-    ("request", "Outgoing request (url, method, headers, body)"),
-    ("client", "httpyac client API (global, test, assert, log)"),
-    ("console", "console.log / console.error"),
-    // Common JS globals available in httpyac script VM (not full Node IntelliSense)
+    // httpyac primary (see https://httpyac.github.io/guide/scripting.html)
+    ("response", "HTTP response (post-request / @forceRef)"),
+    ("request", "Next HTTP request (pre-request; mutable)"),
+    ("client", "IntelliJ-style client (global, test, assert, log)"),
+    ("console", "console.log / info / warn / error → httpyac output"),
+    ("exports", "Pre-request exports.NAME → {{NAME}}"),
+    ("$global", "Global variable store across requests"),
+    ("test", "test(name, fn) — built-in test helper"),
+    ("sleep", "await sleep(ms)"),
+    ("httpFile", "Current http file"),
+    ("httpRegion", "Current request region"),
+    ("$requestClient", "Streaming request client"),
+    ("oauth2Session", "OAuth2 session when used"),
+    ("__dirname", "Directory of current module/file"),
+    ("__filename", "Current file path"),
+    // Common JS / Node in httpyac VM
     ("JSON", "JSON.parse / JSON.stringify"),
     ("Math", "Math.* helpers"),
     ("Date", "Date / Date.now()"),
@@ -152,8 +163,9 @@ pub const SCRIPT_ROOTS: &[(&str, &str)] = &[
     ("Boolean", "Boolean()"),
     ("Error", "throw new Error(…)"),
     ("Buffer", "Node Buffer (if runtime provides it)"),
-    ("require", "require('crypto' | 'fs' | …) — runtime only"),
-    ("crypto", "Often via require('crypto')"),
+    ("require", "require('crypto' | 'fs' | 'assert' | …)"),
+    ("crypto", "Often via require('crypto') — also bare after require"),
+    ("assert", "Often via require('assert')"),
     ("const", "JS const binding"),
     ("let", "JS let binding"),
     ("var", "JS var binding"),
@@ -171,19 +183,29 @@ pub const SCRIPT_ROOTS: &[(&str, &str)] = &[
     ("new", "new Constructor(…)"),
     ("throw", "throw error"),
     ("try", "try { … } catch"),
+    ("debugger", "debugger; for CLI debug"),
 ];
 
-/// Completions after `response.`
+/// Completions after `response.` (httpyac HttpResponse + common aliases)
 pub const RESPONSE_PROPS: &[(&str, &str)] = &[
     ("statusCode", "HTTP status code (number)"),
     ("status", "Status code (alias / JetBrains-style)"),
     ("statusMessage", "Reason phrase"),
     ("headers", "Response headers object"),
-    ("body", "Raw body string / parsed shape (httpyac)"),
+    ("body", "Body (string / object depending on content)"),
     ("parsedBody", "Parsed JSON/XML body when available"),
-    ("contentType", "Content-Type header value"),
-    ("rawBody", "Raw body buffer / bytes"),
-    ("responseTime", "Timing (ms), if available"),
+    ("prettyPrintBody", "Pretty-printed body string"),
+    ("contentType", "Parsed content-type"),
+    ("rawBody", "Raw body Buffer"),
+    ("rawHeaders", "Raw header lines"),
+    ("httpVersion", "HTTP version string"),
+    ("protocol", "Protocol (HTTP, etc.)"),
+    ("name", "Response / request name if set"),
+    ("request", "The request object that produced this response"),
+    ("timings", "Timing phases (HttpTimings)"),
+    ("meta", "Extra metadata map"),
+    ("tags", "Tags array"),
+    ("responseTime", "Timing (ms), if available (alias)"),
 ];
 
 /// Completions after `response.headers.`
@@ -242,28 +264,138 @@ pub const REQUIRE_MODULES: &[&str] = &[
     "assert",
 ];
 
-/// Completions after `request.`
+/// `crypto.` — Node crypto (httpyac script VM). Not full tsserver; curated for common APIs.
+pub const CRYPTO_PROPS: &[(&str, &str)] = &[
+    ("createHmac", "crypto.createHmac(algorithm, key) → Hmac"),
+    ("createHash", "crypto.createHash(algorithm) → Hash"),
+    ("createSign", "crypto.createSign(algorithm) → Sign"),
+    ("createVerify", "crypto.createVerify(algorithm) → Verify"),
+    ("randomBytes", "crypto.randomBytes(size) → Buffer"),
+    ("randomUUID", "crypto.randomUUID() → string"),
+    ("pbkdf2", "crypto.pbkdf2(password, salt, iterations, keylen, digest, cb)"),
+    ("pbkdf2Sync", "crypto.pbkdf2Sync(…) → Buffer"),
+    ("scrypt", "crypto.scrypt(…)"),
+    ("scryptSync", "crypto.scryptSync(…) → Buffer"),
+    ("createCipheriv", "crypto.createCipheriv(algorithm, key, iv)"),
+    ("createDecipheriv", "crypto.createDecipheriv(algorithm, key, iv)"),
+    ("publicEncrypt", "crypto.publicEncrypt(key, buffer)"),
+    ("privateDecrypt", "crypto.privateDecrypt(key, buffer)"),
+    ("timingSafeEqual", "crypto.timingSafeEqual(a, b)"),
+    ("getHashes", "crypto.getHashes() → string[]"),
+    ("getCiphers", "crypto.getCiphers() → string[]"),
+    ("constants", "crypto.constants"),
+];
+
+/// After `createHmac(…).` / `createHash(…).` / `.update(…).` (fluent API through digest)
+pub const CRYPTO_HASH_CHAIN_PROPS: &[(&str, &str)] = &[
+    (
+        "update",
+        "hmac/hash.update(data, inputEncoding?) → this (chain; call again or .digest)",
+    ),
+    (
+        "digest",
+        "hmac/hash.digest('hex'|'base64'|…) → string | Buffer (end of chain)",
+    ),
+    ("copy", "hash.copy() → Hash (Hash only; copies state)"),
+];
+
+/// `digest('…` encoding arguments (Node crypto)
+pub const CRYPTO_DIGEST_ENCODINGS: &[&str] =
+    &["hex", "base64", "base64url", "latin1", "binary", "utf8"];
+
+/// Full one-shot snippets when picking createHmac / createHash from `crypto.`
+pub const CRYPTO_CREATE_HMAC_SNIPPET: &str =
+    "createHmac('${1:sha256}', ${2:'secret'})\n  .update(${3:data})\n  .digest('${4:base64}')";
+pub const CRYPTO_CREATE_HASH_SNIPPET: &str =
+    "createHash('${1:sha256}')\n  .update(${2:data})\n  .digest('${3:hex}')";
+/// After `).` prefer finishing with update→digest in one step
+pub const CRYPTO_UPDATE_THEN_DIGEST_SNIPPET: &str =
+    "update(${1:data}).digest('${2:base64}')";
+
+/// `fs.` common sync APIs used in scripts
+pub const FS_PROPS: &[(&str, &str)] = &[
+    ("readFileSync", "fs.readFileSync(path, encoding?)"),
+    ("writeFileSync", "fs.writeFileSync(path, data)"),
+    ("existsSync", "fs.existsSync(path)"),
+    ("readdirSync", "fs.readdirSync(path)"),
+    ("statSync", "fs.statSync(path)"),
+    ("mkdirSync", "fs.mkdirSync(path, opts?)"),
+    ("readFile", "fs.readFile(path, cb)"),
+    ("writeFile", "fs.writeFile(path, data, cb)"),
+];
+
+/// `path.`
+pub const PATH_PROPS: &[(&str, &str)] = &[
+    ("join", "path.join(…)"),
+    ("resolve", "path.resolve(…)"),
+    ("basename", "path.basename(p)"),
+    ("dirname", "path.dirname(p)"),
+    ("extname", "path.extname(p)"),
+    ("parse", "path.parse(p)"),
+    ("sep", "path.sep"),
+];
+
+/// `Buffer.` static
+pub const BUFFER_STATIC_PROPS: &[(&str, &str)] = &[
+    ("from", "Buffer.from(data, encoding?)"),
+    ("alloc", "Buffer.alloc(size)"),
+    ("allocUnsafe", "Buffer.allocUnsafe(size)"),
+    ("concat", "Buffer.concat(list)"),
+    ("isBuffer", "Buffer.isBuffer(obj)"),
+    ("byteLength", "Buffer.byteLength(string, encoding?)"),
+];
+
+/// `exports.` — httpyac pre-request script side-channel (then {{authDate}} etc.)
+pub const EXPORTS_NOTE: &str =
+    "httpyac pre-request: assign exports.NAME then use {{NAME}} in the request";
+
+/// Completions after `request.` (httpyac HttpRequest / Request)
 pub const REQUEST_PROPS: &[(&str, &str)] = &[
-    ("url", "Request URL"),
+    ("url", "Request URL (mutable in pre-request)"),
     ("method", "HTTP method"),
     ("headers", "Request headers object (mutable in pre-request)"),
     ("body", "Request body"),
+    ("contentType", "Parsed content-type"),
+    ("protocol", "Protocol"),
+    ("timeout", "Timeout (ms)"),
+    ("proxy", "Proxy URL"),
+    ("noRedirect", "Disable following redirects"),
+    ("noRejectUnauthorized", "Skip TLS verify"),
+    ("supportsStreaming", "Streaming support flag"),
+    ("options", "Underlying got options (advanced)"),
 ];
 
-/// Completions after `client.`
+/// Completions after `client.` (IntelliJ-style + httpyac)
 pub const CLIENT_PROPS: &[(&str, &str)] = &[
-    ("global", "Persistent globals: set / get / clear"),
+    ("global", "Persistent globals: set / get / clear / clearAll"),
     ("test", "client.test(name, () => { … })"),
     ("assert", "client.assert(condition, message?)"),
     ("log", "client.log(…)"),
+    ("exit", "client.exit() — stop further requests (IntelliJ-style)"),
+    ("isInitial", "Whether this is the first request in a run"),
 ];
 
 /// Completions after `client.global.`
 pub const CLIENT_GLOBAL_PROPS: &[(&str, &str)] = &[
     ("set", "client.global.set(key, value)"),
     ("get", "client.global.get(key)"),
+    ("isEmpty", "client.global.isEmpty()"),
     ("clear", "client.global.clear(key?)"),
     ("clearAll", "client.global.clearAll()"),
+];
+
+/// Top-level script globals from httpyac (besides request/response/client)
+pub const HTTPYAC_SCRIPT_GLOBALS: &[(&str, &str)] = &[
+    ("exports", "Pre-request: exports.NAME → {{NAME}} in request"),
+    ("$global", "Cross-request global store ($global.foo = …)"),
+    ("test", "test(name, () => { … }) — assert/chai helpers"),
+    ("sleep", "await sleep(ms)"),
+    ("httpFile", "Current http file model"),
+    ("httpRegion", "Current http region / request block"),
+    ("$requestClient", "Stream extra body on streaming requests"),
+    ("oauth2Session", "OAuth2 session when OpenID is used"),
+    ("__dirname", "Directory of current file"),
+    ("__filename", "Path of current file"),
 ];
 
 /// Snippets for response / script blocks.
@@ -344,20 +476,38 @@ pub fn header_values(name: &str) -> &'static [&'static str] {
     }
 }
 
-/// True if cursor is inside a response/script region for this request block.
-/// Detects: `> {% … %}`, `> {…}`, multi-line `{{ … }}` after the request, or lines under an open script.
+/// True if cursor is inside a httpyac JS script region.
+/// Detects: `> {% … %}`, multi-line `{{ … }}` (pre/post request), require/crypto/exports usage.
 pub fn in_script_context(lines: &[&str], line_idx: usize, before_cursor: &str) -> bool {
     let line = lines.get(line_idx).copied().unwrap_or("").trim_start();
 
     // Current line is a handler / script line
-    if line.starts_with('>') {
+    if line.starts_with('>') || line.starts_with('<') && line.contains("{%") {
         return true;
     }
-    if before_cursor.contains("response.")
-        || before_cursor.contains("request.")
-        || before_cursor.contains("client.")
-        || before_cursor.contains("console.")
-    {
+    // Strong JS/httpyac signals on this line (works even if {{ block detect fails)
+    let js_signals = [
+        "response.",
+        "request.",
+        "client.",
+        "console.",
+        "require(",
+        "crypto.",
+        "exports.",
+        "Buffer.",
+        "JSON.",
+        "Math.",
+        "fs.",
+        "path.",
+        "const ",
+        "let ",
+        "var ",
+        "await ",
+        "async ",
+        "function ",
+        "=>",
+    ];
+    if js_signals.iter().any(|s| before_cursor.contains(s) || line.contains(s)) {
         return true;
     }
 
@@ -431,6 +581,126 @@ pub fn in_script_context(lines: &[&str], line_idx: usize, before_cursor: &str) -
     }
 
     false
+}
+
+/// True if nearby script text looks like an open crypto Hash/Hmac/Sign fluent chain.
+fn crypto_fluent_window(lines: &[&str], line_idx: usize, before_cursor: &str) -> bool {
+    let start = line_idx.saturating_sub(8);
+    let mut window = String::new();
+    for i in start..line_idx {
+        window.push_str(lines.get(i).copied().unwrap_or(""));
+        window.push('\n');
+    }
+    window.push_str(before_cursor);
+    let w = window.as_str();
+    let starters = [
+        "createHmac",
+        "createHash",
+        "createSign",
+        "createVerify",
+        "createHmac(",
+        "createHash(",
+    ];
+    if !starters.iter().any(|s| w.contains(s)) {
+        return false;
+    }
+    // Still in chain if last digest(…) is not the final completed call at cursor,
+    // or user is typing another .member after ).
+    true
+}
+
+/// If cursor is on a crypto fluent chain (possibly multi-line), return the partial
+/// member name after the last `.` (may be empty right after `.`).
+///
+/// Handles:
+/// - `crypto.createHmac('sha256', key).`
+/// - `crypto.createHmac(...).update(data).`
+/// - newline + `.update` / `.digest`
+pub fn crypto_hash_chain_filter(
+    lines: &[&str],
+    line_idx: usize,
+    before_cursor: &str,
+) -> Option<String> {
+    if !crypto_fluent_window(lines, line_idx, before_cursor) {
+        return None;
+    }
+
+    // `...).partial` on same line
+    if let Some(idx) = before_cursor.rfind(").") {
+        let after = &before_cursor[idx + 2..];
+        if after.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(after.to_string());
+        }
+    }
+
+    // Multi-line: `  .partial` or `  .`
+    let trimmed = before_cursor.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('.') {
+        if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(rest.to_string());
+        }
+    }
+
+    // `foo.update(` still inside call — not member complete
+    None
+}
+
+/// Typing `digest('…` or `.digest("` — suggest encodings.
+pub fn crypto_digest_encoding_partial(before_cursor: &str) -> Option<String> {
+    // digest('  or digest("  or .digest('
+    let lower = before_cursor.to_ascii_lowercase();
+    let markers = [".digest(", "digest("];
+    let mut pos = None;
+    for m in markers {
+        if let Some(i) = lower.rfind(m) {
+            pos = Some(i + m.len());
+            break;
+        }
+    }
+    let pos = pos?;
+    let after = before_cursor[pos..].trim_start();
+    let (quote, rest) = if let Some(r) = after.strip_prefix('\'') {
+        ('\'', r)
+    } else if let Some(r) = after.strip_prefix('"') {
+        ('"', r)
+    } else {
+        return None;
+    };
+    if rest.contains(quote) {
+        return None;
+    }
+    Some(
+        rest.chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect(),
+    )
+}
+
+/// Build Zed-safe member completion fields.
+///
+/// Zed client-filters with a query that often includes the receiver + dot
+/// (`request.`, `response.`, `crypto.`, `client.global.`). Therefore:
+/// - `filter_text` / `label` must be **single-line** `path.name` (query is a prefix)
+/// - never put bare `name` alone as the only filter when path is non-empty
+/// - never use `\n` inside filter_text (breaks Zed fuzzy match)
+pub fn member_filter_label(path: &str, name: &str) -> (String, String) {
+    if path.is_empty() {
+        (name.to_string(), name.to_string())
+    } else {
+        let full = format!("{path}.{name}");
+        (full.clone(), full)
+    }
+}
+
+/// Character offset of the member being typed (after the last `.`), or cursor if none.
+pub fn member_replace_start(before_cursor: &str, position_character: u32, filter_len: usize) -> u32 {
+    if before_cursor.ends_with('.') {
+        position_character
+    } else if let Some(dot) = before_cursor.rfind('.') {
+        (dot + 1) as u32
+    } else {
+        (position_character as usize).saturating_sub(filter_len) as u32
+    }
 }
 
 /// Dot-path prefix before cursor for property completion (e.g. "response.st" → ("response", "st")).

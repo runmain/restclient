@@ -33,8 +33,9 @@ Send path:
 |---------------|------------------|
 | `Host`, `{{base_url}}`, `client.global`, `response.` | **httpyac-lsp** (this extension) |
 | JS keywords / `JSON.` / `require('crypto')` module names in scripts | **httpyac-lsp** (curated list, not full Node types) |
-| Script **syntax colors** inside `> {% … %}` | Tree-sitter **injections** (`languages/http/injections.scm`) |
-| Full `crypto.createHmac` method IntelliSense | **Not in `.http`** — Zed does not attach vtsls to injected islands; use a `.js` file if needed |
+| Script `request.` / `client.` (thin hints) | **httpyac-lsp** only on HTTP |
+| **Full** Node/`crypto` IntelliSense (true vtsls) | **`.js`/`.ts` modules** — see [docs/VTSLS-SCRIPTS.md](docs/VTSLS-SCRIPTS.md) + `examples/script-vtsls.http` |
+| JSON body highlighting | Tree-sitter injections (bodies only; no JS inject in scripts) |
 | Running the script | **httpyac CLI** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

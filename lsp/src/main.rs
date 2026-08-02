@@ -1,8 +1,11 @@
 use httpyac_lsp::completions::{
-    dotted_prefix, header_values, in_script_context, ARRAY_PROPS, AUTH_SCHEMES, BUILTIN_VARS,
-    CLIENT_GLOBAL_PROPS, CLIENT_PROPS, DATE_PROPS, HEADER_NAMES, HTTP_METHODS, JSON_PROPS,
-    MATH_PROPS, META_DIRECTIVES, OBJECT_PROPS, REQUEST_PROPS, REQUIRE_MODULES, RESPONSE_HEADERS_PROPS,
-    RESPONSE_PROPS, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
+    crypto_digest_encoding_partial, crypto_hash_chain_filter, dotted_prefix, header_values,
+    in_script_context, member_filter_label, member_replace_start, ARRAY_PROPS, AUTH_SCHEMES,
+    BUFFER_STATIC_PROPS, BUILTIN_VARS, CLIENT_GLOBAL_PROPS, CLIENT_PROPS, CRYPTO_CREATE_HASH_SNIPPET,
+    CRYPTO_CREATE_HMAC_SNIPPET, CRYPTO_DIGEST_ENCODINGS, CRYPTO_HASH_CHAIN_PROPS, CRYPTO_PROPS,
+    CRYPTO_UPDATE_THEN_DIGEST_SNIPPET, DATE_PROPS, EXPORTS_NOTE, FS_PROPS, HEADER_NAMES, HTTP_METHODS,
+    JSON_PROPS, MATH_PROPS, META_DIRECTIVES, OBJECT_PROPS, PATH_PROPS, REQUEST_PROPS, REQUIRE_MODULES,
+    RESPONSE_HEADERS_PROPS, RESPONSE_PROPS, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
 };
 use httpyac_lsp::parser::{parse_http_file, HttpRequest};
 use httpyac_lsp::variables::VariableResolver;
@@ -754,55 +757,240 @@ impl LanguageServer for HttpLsp {
 
         let script_ctx = in_script_context(&lines, line_idx, before_cursor);
 
-        // --- httpyac script: response. / request. / client. ---
+        // --- httpyac / JS script: response. client. crypto. require( … ---
+        // Full vtsls/tsserver cannot attach to injected script islands in .http (Zed limit).
+        // httpyac-lsp provides curated Node + httpyac members so `crypto.createHmac` works.
         if script_ctx {
-            if let Some((path, filter)) = dotted_prefix(before_cursor) {
+            // crypto fluent chain: createHmac/Hash → .update → .digest('base64')
+            // Also multi-line: createHmac(...)\n  .|
+            // ── Unified member completions (request/response/client/console/crypto/…) ──
+            // One rule for all: label+filter_text = "path.name" (single line, no \n).
+            // Zed query is typically "request." / "response.st" / "crypto." — must be a prefix.
+
+            if let Some(enc_partial) = crypto_digest_encoding_partial(before_cursor) {
+                let el = enc_partial.to_lowercase();
+                for enc in CRYPTO_DIGEST_ENCODINGS {
+                    if el.is_empty() || enc.starts_with(el.as_str()) {
+                        items.push(CompletionItem {
+                            label: (*enc).to_string(),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            detail: Some("crypto digest encoding".to_string()),
+                            insert_text: Some((*enc).to_string()),
+                            // single-line only
+                            filter_text: Some((*enc).to_string()),
+                            sort_text: Some(format!("0{enc}")),
+                            documentation: Some(Documentation::String(format!(
+                                "Node crypto: .digest('{enc}')"
+                            ))),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
+                }
+            }
+
+            if let Some(chain_filter) =
+                crypto_hash_chain_filter(&lines, line_idx, before_cursor)
+            {
+                let fl = chain_filter.to_lowercase();
+                let member_start =
+                    member_replace_start(before_cursor, position.character, chain_filter.len());
+
+                if fl.is_empty() || "update".starts_with(&fl) {
+                    let insert = CRYPTO_UPDATE_THEN_DIGEST_SNIPPET.to_string();
+                    items.push(CompletionItem {
+                        label: "update(…).digest(…)".to_string(),
+                        kind: Some(CompletionItemKind::SNIPPET),
+                        detail: Some("crypto — full chain through digest".to_string()),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: line_num,
+                                    character: member_start,
+                                },
+                                end: Position {
+                                    line: line_num,
+                                    character: position.character,
+                                },
+                            },
+                            new_text: insert.clone(),
+                        })),
+                        insert_text: Some(insert),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        // queries: ".", "u", "up", ").", "update"
+                        filter_text: Some("update.digest update ).update .update".into()),
+                        sort_text: Some("00update_digest".into()),
+                        preselect: Some(true),
+                        ..Default::default()
+                    });
+                }
+
+                for (name, desc) in CRYPTO_HASH_CHAIN_PROPS {
+                    if !fl.is_empty() && !name.to_lowercase().starts_with(&fl) {
+                        continue;
+                    }
+                    let (insert, is_snippet) = match *name {
+                        "update" => ("update(${1:data})".to_string(), true),
+                        "digest" => ("digest('${1:base64}')".to_string(), true),
+                        _ => (name.to_string(), false),
+                    };
+                    items.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::METHOD),
+                        detail: Some(format!("crypto chain — {desc}")),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: line_num,
+                                    character: member_start,
+                                },
+                                end: Position {
+                                    line: line_num,
+                                    character: position.character,
+                                },
+                            },
+                            new_text: insert.clone(),
+                        })),
+                        insert_text: Some(insert),
+                        insert_text_format: if is_snippet {
+                            Some(InsertTextFormat::SNIPPET)
+                        } else {
+                            Some(InsertTextFormat::PLAIN_TEXT)
+                        },
+                        filter_text: Some(format!("{name} ).{name} .{name}")),
+                        sort_text: Some(format!("1{name}")),
+                        documentation: Some(Documentation::String(desc.to_string())),
+                        ..Default::default()
+                    });
+                }
+
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
+                }
+            }
+
+            // Resolve path.filter from dotted_prefix OR suffix fallback (request. / response. …)
+            let dotted = dotted_prefix(before_cursor).or_else(|| {
+                let t = before_cursor.trim_end();
+                for (suf, path) in [
+                    ("client.global.", "client.global"),
+                    ("response.headers.", "response.headers"),
+                    ("response.", "response"),
+                    ("request.", "request"),
+                    ("client.", "client"),
+                    ("console.", "console"),
+                    ("crypto.", "crypto"),
+                    ("Buffer.", "Buffer"),
+                    ("JSON.", "JSON"),
+                    ("Math.", "Math"),
+                    ("Object.", "Object"),
+                    ("Array.", "Array"),
+                    ("Date.", "Date"),
+                    ("fs.", "fs"),
+                    ("path.", "path"),
+                ] {
+                    if t.ends_with(suf) {
+                        return Some((path.to_string(), String::new()));
+                    }
+                }
+                None
+            });
+
+            if let Some((path, filter)) = dotted {
                 let filter_l = filter.to_lowercase();
+                let member_start =
+                    member_replace_start(before_cursor, position.character, filter.len());
+
                 let push_props = |items: &mut Vec<CompletionItem>,
                                   props: &[(&str, &str)],
-                                  sort_prefix: &str| {
+                                  sort_prefix: &str,
+                                  detail_prefix: &str| {
                     for (name, desc) in props {
-                        if filter_l.is_empty() || name.to_lowercase().starts_with(&filter_l) {
-                            items.push(CompletionItem {
-                                label: name.to_string(),
-                                kind: Some(CompletionItemKind::PROPERTY),
-                                detail: Some(format!("httpyac — {desc}")),
-                                insert_text: Some(name.to_string()),
-                                filter_text: Some(name.to_string()),
-                                sort_text: Some(format!("{sort_prefix}{name}")),
-                                documentation: Some(Documentation::String(desc.to_string())),
-                                ..Default::default()
-                            });
+                        if !filter_l.is_empty() && !name.to_lowercase().starts_with(&filter_l) {
+                            continue;
                         }
+                        let (insert, is_snippet) = match *name {
+                            "createHmac" => (CRYPTO_CREATE_HMAC_SNIPPET.to_string(), true),
+                            "createHash" => (CRYPTO_CREATE_HASH_SNIPPET.to_string(), true),
+                            "randomBytes" => ("randomBytes(${1:16})".to_string(), true),
+                            "randomUUID" => ("randomUUID()".to_string(), true),
+                            "readFileSync" => {
+                                ("readFileSync(${1:path}, '${2:utf8}')".to_string(), true)
+                            }
+                            "update" => ("update(${1:data})".to_string(), true),
+                            "digest" => ("digest('${1:base64}')".to_string(), true),
+                            "log" | "error" | "warn" | "info"
+                                if path == "console" =>
+                            {
+                                (format!("{name}($1)"), true)
+                            }
+                            _ => (name.to_string(), false),
+                        };
+                        let (filter_text, label) = member_filter_label(&path, name);
+                        items.push(CompletionItem {
+                            label,
+                            kind: Some(CompletionItemKind::METHOD),
+                            detail: Some(format!("{detail_prefix} — {desc}")),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: line_num,
+                                        character: member_start,
+                                    },
+                                    end: Position {
+                                        line: line_num,
+                                        character: position.character,
+                                    },
+                                },
+                                new_text: insert.clone(),
+                            })),
+                            insert_text: Some(insert),
+                            insert_text_format: if is_snippet {
+                                Some(InsertTextFormat::SNIPPET)
+                            } else {
+                                Some(InsertTextFormat::PLAIN_TEXT)
+                            },
+                            filter_text: Some(filter_text),
+                            sort_text: Some(format!("{sort_prefix}{name}")),
+                            documentation: Some(Documentation::String(desc.to_string())),
+                            ..Default::default()
+                        });
                     }
                 };
 
                 match path.as_str() {
                     "" => {
-                        // bare identifier in script (httpyac APIs + common JS)
+                        // bare roots: request / response / client / crypto / …
+                        // commit_characters "." so accept + type dot continues smoothly
+                        let member_roots = [
+                            "request", "response", "client", "console", "crypto", "exports",
+                            "$global", "test", "sleep", "require", "Buffer", "JSON", "Math",
+                        ];
                         for (name, desc) in SCRIPT_ROOTS {
                             if filter_l.is_empty() || name.to_lowercase().starts_with(&filter_l) {
                                 let kind = if matches!(
                                     *name,
-                                    "const"
-                                        | "let"
-                                        | "var"
-                                        | "if"
-                                        | "for"
-                                        | "while"
-                                        | "return"
-                                        | "await"
-                                        | "async"
-                                        | "typeof"
-                                        | "new"
-                                        | "throw"
-                                        | "try"
+                                    "const" | "let" | "var" | "if" | "for" | "while" | "return"
+                                        | "await" | "async" | "typeof" | "new" | "throw" | "try"
                                 ) {
                                     CompletionItemKind::KEYWORD
                                 } else if matches!(*name, "require") {
                                     CompletionItemKind::FUNCTION
                                 } else {
                                     CompletionItemKind::VARIABLE
+                                };
+                                let commit = if member_roots.contains(name) {
+                                    Some(vec![".".to_string()])
+                                } else {
+                                    None
                                 };
                                 items.push(CompletionItem {
                                     label: name.to_string(),
@@ -811,10 +999,24 @@ impl LanguageServer for HttpLsp {
                                     insert_text: Some(name.to_string()),
                                     filter_text: Some(name.to_string()),
                                     sort_text: Some(format!("0{name}")),
+                                    commit_characters: commit,
                                     documentation: Some(Documentation::String(desc.to_string())),
                                     ..Default::default()
                                 });
                             }
+                        }
+                        if filter_l.is_empty() || "exports".starts_with(&filter_l) {
+                            items.push(CompletionItem {
+                                label: "exports".to_string(),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some(EXPORTS_NOTE.to_string()),
+                                insert_text: Some("exports".to_string()),
+                                filter_text: Some("exports".to_string()),
+                                sort_text: Some("0exports".to_string()),
+                                commit_characters: Some(vec![".".to_string()]),
+                                documentation: Some(Documentation::String(EXPORTS_NOTE.to_string())),
+                                ..Default::default()
+                            });
                         }
                         for (label, detail, body) in SCRIPT_SNIPPETS {
                             if filter_l.is_empty()
@@ -833,32 +1035,63 @@ impl LanguageServer for HttpLsp {
                             }
                         }
                     }
-                    "response" => push_props(&mut items, RESPONSE_PROPS, "1"),
-                    "response.headers" => push_props(&mut items, RESPONSE_HEADERS_PROPS, "1"),
-                    "request" => push_props(&mut items, REQUEST_PROPS, "1"),
-                    "client" => push_props(&mut items, CLIENT_PROPS, "1"),
-                    "client.global" => push_props(&mut items, CLIENT_GLOBAL_PROPS, "1"),
-                    "JSON" => push_props(&mut items, JSON_PROPS, "1"),
-                    "Math" => push_props(&mut items, MATH_PROPS, "1"),
-                    "Object" => push_props(&mut items, OBJECT_PROPS, "1"),
-                    "Array" => push_props(&mut items, ARRAY_PROPS, "1"),
-                    "Date" => push_props(&mut items, DATE_PROPS, "1"),
+                    "response" => push_props(&mut items, RESPONSE_PROPS, "1", "response"),
+                    "response.headers" => {
+                        push_props(&mut items, RESPONSE_HEADERS_PROPS, "1", "response.headers")
+                    }
+                    "request" => push_props(&mut items, REQUEST_PROPS, "1", "request"),
+                    "client" => push_props(&mut items, CLIENT_PROPS, "1", "client"),
+                    "client.global" => {
+                        push_props(&mut items, CLIENT_GLOBAL_PROPS, "1", "client.global")
+                    }
+                    "JSON" => push_props(&mut items, JSON_PROPS, "1", "JSON"),
+                    "Math" => push_props(&mut items, MATH_PROPS, "1", "Math"),
+                    "Object" => push_props(&mut items, OBJECT_PROPS, "1", "Object"),
+                    "Array" => push_props(&mut items, ARRAY_PROPS, "1", "Array"),
+                    "Date" => push_props(&mut items, DATE_PROPS, "1", "Date"),
+                    "crypto" => push_props(&mut items, CRYPTO_PROPS, "0", "node:crypto"),
+                    "fs" => push_props(&mut items, FS_PROPS, "0", "node:fs"),
+                    "path" => push_props(&mut items, PATH_PROPS, "0", "node:path"),
+                    "Buffer" => push_props(&mut items, BUFFER_STATIC_PROPS, "0", "node:Buffer"),
                     "console" => {
                         for name in ["log", "error", "warn", "info"] {
                             if filter_l.is_empty() || name.starts_with(filter_l.as_str()) {
+                                let (ft, label) = member_filter_label("console", name);
+                                let insert = format!("{name}($1)");
                                 items.push(CompletionItem {
-                                    label: name.to_string(),
+                                    label,
                                     kind: Some(CompletionItemKind::METHOD),
                                     detail: Some("console".to_string()),
-                                    insert_text: Some(format!("{name}($1)")),
+                                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                        range: Range {
+                                            start: Position {
+                                                line: line_num,
+                                                character: member_start,
+                                            },
+                                            end: Position {
+                                                line: line_num,
+                                                character: position.character,
+                                            },
+                                        },
+                                        new_text: insert.clone(),
+                                    })),
+                                    insert_text: Some(insert),
                                     insert_text_format: Some(InsertTextFormat::SNIPPET),
-                                    filter_text: Some(name.to_string()),
+                                    filter_text: Some(ft),
+                                    sort_text: Some(format!("0{name}")),
                                     ..Default::default()
                                 });
                             }
                         }
                     }
                     _ => {}
+                }
+
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
                 }
             }
 

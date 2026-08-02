@@ -119,13 +119,26 @@ If settings contain `//` comments, the install script **skips auto-write** by de
 
 | Layer | What you get |
 |-------|----------------|
-| **Tree-sitter injection** (`injections.scm`) | JS/JSON **syntax highlighting** inside `> {% … %}` / `< {% … %}` |
-| **httpyac-lsp** | Completions for `response.` / `request.` / `client.` / `console.` / `JSON.` / common JS keywords & `require('…')` modules |
-| **vtsls / typescript-language-server** | **Not attached** to `.http` buffers. Zed runs language servers for the **file language** (HTTP), not for each injected island. So you will **not** get full Node IntelliSense like `crypto.createHmac` method lists inside scripts. |
+| **httpyac-lsp** | `response.` / `request.` / `client.` / `console.` / `crypto.` / `require('…')` (curated) |
+| **JSON/XML/GraphQL body injection** | Body **highlighting** only |
+| **JS injection into scripts** | **Disabled on purpose** — if enabled, Zed routes completions to **vtsls**, which errors on `.http` and **hides** httpyac-lsp results |
+| **vtsls on `languages.HTTP`** | **Do not enable.** Logs show: `Get completion via vtsls failed: Reduce of empty array…` |
 
-Runtime of scripts is always **httpyac CLI** (its JS VM), independent of the editor LSP.
+### Required settings for script completions
 
-To edit complex JS with full IntelliSense, keep it in a separate `.js` file and `@import` / call out from httpyac if your workflow allows — or rely on httpyac-lsp’s script hints above.
+```json
+"languages": {
+  "HTTP": {
+    "language_servers": ["httpyac-lsp"],
+    "completions": { "lsp": true, "words": "disabled" }
+  }
+}
+```
+
+**Never** add `"vtsls"` (or `typescript-language-server`) next to `httpyac-lsp` for HTTP.
+
+Runtime of scripts is always **httpyac CLI**.
+
 ## Troubleshooting
 
 | Symptom | Action |
@@ -135,6 +148,7 @@ To edit complex JS with full IntelliSense, keep it in a separate `.js` file and 
 | `base_url is not defined` | Use **httpyac-run** (with `--env`); put `@vars` **before** first `###`; check `activeEnv` |
 | No Switch Environment menu | Reinstall / refresh `tasks.json`; restart Zed |
 | LSP not running | `ls ~/.local/bin/httpyac-lsp`; Server Logs → HTTPyac LSP |
-| No `crypto.` methods | Install/enable JS/TS in Zed (editor-level); httpyac-lsp only covers httpyac APIs |
+| No full `crypto.` in `.http` | Move logic to `examples/scripts/*.js` and use vtsls there ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)) |
+| vtsls errors on `.http` | Remove `vtsls` from `languages.HTTP.language_servers` |
 
 See also [README.md](../README.md).

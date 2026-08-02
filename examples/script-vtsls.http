@@ -1,0 +1,40 @@
+# =============================================================================
+# Real vtsls workflow (full Node API, any variable names)
+# =============================================================================
+# Zed cannot run true vtsls *inside* {{ }} blocks of an HTTP buffer.
+# Pattern:
+#   1. Put heavy JS in examples/scripts/*.js  → open that file → vtsls works
+#   2. Keep .http scripts thin: require() + exports only
+#   3. languages.HTTP must be ONLY ["httpyac-lsp"] (never add vtsls here)
+#
+# Open: examples/scripts/auth-sign.js  and type crypto.  — full IntelliSense.
+# =============================================================================
+
+@host = https://httpbin.org
+
+### Signed POST (logic lives in auth-sign.js)
+{{
+  // Thin glue only — full crypto lives in ./scripts/auth-sign.js (vtsls there)
+  const { signRequest } = require('./scripts/auth-sign.js');
+  const signed = signRequest(request, 'secret');
+  exports.authDate = signed.authDate;
+  exports.authentication = signed.authentication;
+}}
+POST {{host}}/anything
+Date: {{authDate}}
+Authentication: {{authentication}}
+Content-Type: application/json
+
+{
+  "via": "external-js-module",
+  "note": "Edit auth-sign.js for createHmac / update / digest with real vtsls"
+}
+
+###
+# Post-request: keep asserts thin or move to a .js helper similarly
+{{
+  const assert = require('assert');
+  test('got a body', () => {
+    assert.ok(response.parsedBody);
+  });
+}}
