@@ -692,14 +692,92 @@ pub fn member_filter_label(path: &str, name: &str) -> (String, String) {
     }
 }
 
-/// Character offset of the member being typed (after the last `.`), or cursor if none.
-pub fn member_replace_start(before_cursor: &str, position_character: u32, filter_len: usize) -> u32 {
+/// UTF-16 code unit offset (LSP `Position.character`) → UTF-8 byte index in `line`.
+/// Always lands on a char boundary; never panics on out-of-range or mid-code-unit values.
+pub fn lsp_utf16_to_byte(line: &str, utf16_col: u32) -> usize {
+    if utf16_col == 0 {
+        return 0;
+    }
+    let mut seen = 0u32;
+    for (byte_idx, ch) in line.char_indices() {
+        if seen >= utf16_col {
+            return byte_idx;
+        }
+        let w = ch.len_utf16() as u32;
+        // If utf16_col falls inside a surrogate pair (len_utf16==2), snap to this char start.
+        if seen + w > utf16_col {
+            return byte_idx;
+        }
+        seen += w;
+    }
+    line.len()
+}
+
+/// UTF-8 byte index → LSP UTF-16 `Position.character` (clamped to char boundary).
+pub fn byte_to_lsp_utf16(line: &str, mut byte_idx: usize) -> u32 {
+    if byte_idx > line.len() {
+        byte_idx = line.len();
+    }
+    while byte_idx > 0 && !line.is_char_boundary(byte_idx) {
+        byte_idx -= 1;
+    }
+    line[..byte_idx].encode_utf16().count() as u32
+}
+
+/// Byte offset (into `before_cursor` / line prefix) of the member being typed.
+pub fn member_replace_start_byte(before_cursor: &str, filter_len: usize) -> usize {
     if before_cursor.ends_with('.') {
-        position_character
+        before_cursor.len()
     } else if let Some(dot) = before_cursor.rfind('.') {
-        (dot + 1) as u32
+        dot + 1
     } else {
-        (position_character as usize).saturating_sub(filter_len) as u32
+        before_cursor.len().saturating_sub(filter_len)
+    }
+}
+
+/// Legacy helper: member start as LSP UTF-16 column on `line` (prefix = before_cursor).
+pub fn member_replace_start(before_cursor: &str, position_character: u32, filter_len: usize) -> u32 {
+    let _ = position_character;
+    let byte = member_replace_start_byte(before_cursor, filter_len);
+    // before_cursor is a prefix of the line; byte index equals line byte index
+    byte_to_lsp_utf16(before_cursor, byte)
+}
+
+#[cfg(test)]
+mod utf16_pos_tests {
+    use super::{byte_to_lsp_utf16, lsp_utf16_to_byte};
+
+    #[test]
+    fn ascii_roundtrip() {
+        let line = "Host: {{api}}";
+        for col in 0..=line.len() as u32 {
+            let b = lsp_utf16_to_byte(line, col);
+            assert!(line.is_char_boundary(b));
+            let _ = &line[..b];
+            let _ = &line[b..];
+        }
+    }
+
+    #[test]
+    fn chinese_never_panics_mid_char() {
+        let line = "Host: {{中文}}";
+        // Probe every utf16 column including those that would be mid-scalar if mis-counted
+        let u16_len = line.encode_utf16().count() as u32;
+        for col in 0..=u16_len + 5 {
+            let b = lsp_utf16_to_byte(line, col);
+            assert!(line.is_char_boundary(b), "col {col} -> byte {b}");
+            let _ = &line[..b];
+            let _ = &line[b..];
+            let back = byte_to_lsp_utf16(line, b);
+            assert!(back <= u16_len + 1);
+        }
+    }
+
+    #[test]
+    fn emoji_boundary() {
+        let line = "x👍y"; // thumbs up is one extended grapheme, utf16 len 2
+        let b = lsp_utf16_to_byte(line, 2); // after high surrogate only → snap to 👍 start or after
+        assert!(line.is_char_boundary(b));
     }
 }
 

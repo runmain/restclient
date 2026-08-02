@@ -5,6 +5,7 @@
 
 pub mod completions;
 pub mod parser;
+pub mod script_ext;
 pub mod variables;
 
 use std::path::{Path, PathBuf};

@@ -35,6 +35,10 @@ node_modules/
 package-lock.json
 npm-debug.log*
 
+# date-fns full package under .script/ (~17MB); keep date-fns.js facade in git.
+# Re-fetch: examples/.script/fetch-date-fns.sh
+examples/.script/date-fns/
+
 # ── Env / secrets (never commit private env) ────────────
 http-client.private.env.json
 **/*.private.env.json

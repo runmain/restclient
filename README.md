@@ -35,6 +35,8 @@ Send path:
 | JS keywords / `JSON.` / `require('crypto')` module names in scripts | **httpyac-lsp** (curated list, not full Node types) |
 | Script `request.` / `client.` (thin hints) | **httpyac-lsp** only on HTTP |
 | **Full** Node/`crypto` IntelliSense (true vtsls) | **`.js`/`.ts` modules** — see [docs/VTSLS-SCRIPTS.md](docs/VTSLS-SCRIPTS.md) + `examples/script-vtsls.http` |
+| **Builtin + user script modules** (`request`/`client`/`crypto`/… as JS; user `.script` overrides) | [docs/SCRIPT-EXT.md](docs/SCRIPT-EXT.md) + `lsp/builtin_script/` |
+| **Review / crash-hardening notes** | [docs/REVIEW-SCRIPT-COMPLETIONS.md](docs/REVIEW-SCRIPT-COMPLETIONS.md) |
 | JSON body highlighting | Tree-sitter injections (bodies only; no JS inject in scripts) |
 | Running the script | **httpyac CLI** |
 

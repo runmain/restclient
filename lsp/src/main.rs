@@ -1,19 +1,24 @@
 use httpyac_lsp::completions::{
-    crypto_digest_encoding_partial, crypto_hash_chain_filter, dotted_prefix, header_values,
-    in_script_context, member_filter_label, member_replace_start, ARRAY_PROPS, AUTH_SCHEMES,
-    BUFFER_STATIC_PROPS, BUILTIN_VARS, CLIENT_GLOBAL_PROPS, CLIENT_PROPS, CRYPTO_CREATE_HASH_SNIPPET,
-    CRYPTO_CREATE_HMAC_SNIPPET, CRYPTO_DIGEST_ENCODINGS, CRYPTO_HASH_CHAIN_PROPS, CRYPTO_PROPS,
-    CRYPTO_UPDATE_THEN_DIGEST_SNIPPET, DATE_PROPS, EXPORTS_NOTE, FS_PROPS, HEADER_NAMES, HTTP_METHODS,
-    JSON_PROPS, MATH_PROPS, META_DIRECTIVES, OBJECT_PROPS, PATH_PROPS, REQUEST_PROPS, REQUIRE_MODULES,
-    RESPONSE_HEADERS_PROPS, RESPONSE_PROPS, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
+    byte_to_lsp_utf16, crypto_digest_encoding_partial, crypto_hash_chain_filter, dotted_prefix,
+    header_values, in_script_context, lsp_utf16_to_byte, member_filter_label,
+    member_replace_start_byte, AUTH_SCHEMES, BUILTIN_VARS, CRYPTO_CREATE_HASH_SNIPPET,
+    CRYPTO_CREATE_HMAC_SNIPPET, CRYPTO_DIGEST_ENCODINGS, CRYPTO_HASH_CHAIN_PROPS,
+    CRYPTO_UPDATE_THEN_DIGEST_SNIPPET, HEADER_NAMES, HTTP_METHODS, META_DIRECTIVES,
+    REQUIRE_MODULES, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
 };
 use httpyac_lsp::parser::{parse_http_file, HttpRequest};
+use httpyac_lsp::script_ext::{
+    enrich_catalog_from_requires, ingest_script_locals, parse_typed_bindings,
+    resolve_completion_path, resolve_path_with_bindings, script_window_text, PathResolve,
+    ScriptCatalog, ScriptCatalogCache, ScriptMember,
+};
 use httpyac_lsp::variables::VariableResolver;
 use httpyac_lsp::{collect_env_names, resolve_httpyac_bin};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -64,6 +69,8 @@ struct Document {
 struct HttpLsp {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
+    /// Cached parse of nearest `.script/*.js` (any files the user adds).
+    script_catalog: Arc<Mutex<ScriptCatalogCache>>,
 }
 
 impl HttpLsp {
@@ -71,6 +78,29 @@ impl HttpLsp {
         HttpLsp {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
+            script_catalog: Arc::new(Mutex::new(ScriptCatalogCache::default())),
+        }
+    }
+
+    /// Builtin + user `.script/` catalog for this HTTP file’s directory.
+    /// Always available (builtins embedded even without a user `.script/`).
+    /// Never panics: on failure falls back to builtin-only catalog.
+    async fn catalog_for_uri(&self, uri: &Url) -> ScriptCatalog {
+        let dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut cache = self.script_catalog.lock().await;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_or_load(&dir).clone()
+        })) {
+            Ok(cat) => cat,
+            Err(_) => {
+                // Reset poisoned-ish cache state by replacing catalog
+                *cache = ScriptCatalogCache::default();
+                httpyac_lsp::script_ext::load_builtin_catalog()
+            }
         }
     }
 
@@ -264,14 +294,15 @@ impl HttpLsp {
 }
 
 /// Detect cursor inside / starting a `{{ … }}` for variable completion.
-/// Returns (replace_start_character, partial name, replace_end_extra after cursor).
+/// Returns (**byte** offset of open in `before`, partial name, closing extra after cursor).
+/// Caller converts the byte offset to LSP UTF-16 via `byte_to_lsp_utf16` on the full line.
 ///
 /// Examples (cursor at |):
 /// - `{{|` / `{{|}}`     → partial ""
 /// - `{{b|` / `{{b|}}`   → partial "b"
 /// - `{|` / `{|}`        → partial "" (Zed brace-autoclose first `{`)
 /// - `{{base_url}}|`     → None (already closed before cursor)
-fn mustache_context(before: &str, after: &str, _char_pos: u32) -> Option<(u32, String, u32)> {
+fn mustache_context(before: &str, after: &str, _char_pos: u32) -> Option<(usize, String, u32)> {
     // Prefer real `{{ …` open
     if let Some(open) = before.rfind("{{") {
         let between = &before[open + 2..];
@@ -284,14 +315,14 @@ fn mustache_context(before: &str, after: &str, _char_pos: u32) -> Option<(u32, S
             .collect();
         // Consume auto-closed `}}` or `}` after cursor so replace doesn't leave extras
         let extra = mustache_closing_extra(after);
-        return Some((open as u32, partial, extra));
+        return Some((open, partial, extra));
     }
 
     // Single `{` — common with Zed `brackets` auto-close (`{|}` while typing `{{`)
     if before.ends_with('{') && !before.ends_with("\\{") {
         let open = before.len() - 1;
         let extra = mustache_closing_extra(after);
-        return Some((open as u32, String::new(), extra));
+        return Some((open, String::new(), extra));
     }
 
     let _ = after;
@@ -499,10 +530,26 @@ impl LanguageServer for HttpLsp {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        // Panic isolation: sync body is catch_unwind'd inside completion_inner.
+        match self.completion_inner(params).await {
+            Ok(r) => Ok(r),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl HttpLsp {
+    async fn completion_inner(
+        &self,
+        params: CompletionParams,
+    ) -> std::result::Result<Option<CompletionResponse>, ()> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Prefer in-memory buffer; fall back to disk (unsynced / not yet did_open)
         let content = {
             let docs = self.documents.read().await;
             if let Some(d) = docs.get(&uri) {
@@ -517,28 +564,62 @@ impl LanguageServer for HttpLsp {
             return Ok(None);
         }
 
+        let catalog = self.catalog_for_uri(&uri).await;
+        let env_vars = Self::load_env_vars_for_completion(&uri);
+        let http_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completion_sync(&content, position, &catalog, &env_vars, &http_dir)
+        }));
+        match result {
+            Ok(r) => Ok(r),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// Sync completion body (panic-catchable). Kept free of `.await`.
+fn completion_sync(
+    content: &str,
+    position: Position,
+    script_catalog: &ScriptCatalog,
+    env_vars: &[(String, String, String)],
+    http_file_dir: &std::path::Path,
+) -> Option<CompletionResponse> {
         let lines: Vec<&str> = content.split('\n').collect();
 
         if position.line as usize >= lines.len() {
-            return Ok(None);
+            return None;
         }
 
         let line_idx = position.line as usize;
         let current_line = lines[line_idx];
-        // Zed may send UTF-16 offsets; for ASCII .http this matches bytes. Clamp safely.
-        let char_pos = (position.character as usize).min(current_line.len());
-        let before_cursor = &current_line[..char_pos];
-        let after_cursor = &current_line[char_pos..];
+        // LSP Position.character is UTF-16; Rust str indices are UTF-8 bytes.
+        // Never slice at a mid-codepoint (historical panic → Zed "server shut down").
+        let byte_pos = lsp_utf16_to_byte(current_line, position.character);
+        let before_cursor = &current_line[..byte_pos];
+        let after_cursor = &current_line[byte_pos..];
         let trimmed = before_cursor.trim();
         let full_line_trimmed = current_line.trim();
         let line_num = position.line;
-        let line_start_char = (current_line.len() - current_line.trim_start().len()) as u32;
+        let line_start_byte = current_line.len() - current_line.trim_start().len();
+        let line_start_char = byte_to_lsp_utf16(current_line, line_start_byte);
+
+        // Helper: byte offset within current_line → LSP UTF-16 column
+        let col_at = |byte_in_line: usize| byte_to_lsp_utf16(current_line, byte_in_line);
+        // Member replace start as UTF-16 column (from before_cursor byte offset)
+        let member_col =
+            |before: &str, filter_len: usize| col_at(member_replace_start_byte(before, filter_len));
 
         let mut items = Vec::new();
 
         // ### separators: no completions
         if full_line_trimmed.starts_with("###") && !before_cursor.contains("{{") {
-            return Ok(None);
+            return None;
         }
 
         // ── {{ variable }} completion — HIGHEST priority (URL / header / body / script) ──
@@ -549,19 +630,17 @@ impl LanguageServer for HttpLsp {
         // languages/http/config.toml marks `{` `}` as word_characters so the query is
         // always the mustache token (`{{` / `{{b`), never `Host: {{` or `"user": "{{`.
         // filter_text/label stay mustache-shaped so URL/header/body/script all match.
-        if let Some((var_start, partial, close_extra)) =
+        if let Some((var_start_byte, partial, close_extra)) =
             mustache_context(before_cursor, after_cursor, position.character)
         {
             let partial_l = partial.to_lowercase();
             let mut seen = std::collections::HashSet::new();
+            let var_start = col_at(var_start_byte);
             let end_char = position.character + close_extra;
             // Full line text through cursor — belt-and-suspenders if Zed still sends a
             // long query (older config without word_characters fix).
             let typed_through = before_cursor.to_string();
-            let line_prefix = before_cursor
-                .get(..var_start as usize)
-                .unwrap_or("")
-                .to_string();
+            let line_prefix = before_cursor.get(..var_start_byte).unwrap_or("").to_string();
 
             let push_var = |items: &mut Vec<CompletionItem>,
                             var_name: &str,
@@ -604,7 +683,7 @@ impl LanguageServer for HttpLsp {
             };
 
             // http-client.env.json (all environments)
-            for (var_name, var_value, source) in Self::load_env_vars_for_completion(&uri) {
+            for (var_name, var_value, source) in env_vars.iter().cloned() {
                 if !partial_l.is_empty() && !var_name.to_lowercase().starts_with(&partial_l) {
                     continue;
                 }
@@ -670,13 +749,13 @@ impl LanguageServer for HttpLsp {
             // Inside {{ }}, return only variable items (don't mix headers)
             if !items.is_empty() {
                 // is_incomplete so Zed re-queries as the user types more of the name
-                return Ok(Some(CompletionResponse::List(CompletionList {
+                return Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
                     items,
-                })));
+                }));
             }
             // Still inside mustache but no matches — don't fall through to Host etc.
-            return Ok(None);
+            return None;
         }
 
         // --- httpyac meta: # @name / // @ref ---
@@ -750,17 +829,29 @@ impl LanguageServer for HttpLsp {
                 }
             }
             if !items.is_empty() {
-                return Ok(Some(CompletionResponse::Array(items)));
+                return Some(CompletionResponse::Array(items));
             }
-            return Ok(None);
+            return None;
         }
 
         let script_ctx = in_script_context(&lines, line_idx, before_cursor);
 
         // --- httpyac / JS script: response. client. crypto. require( … ---
         // Full vtsls/tsserver cannot attach to injected script islands in .http (Zed limit).
-        // httpyac-lsp provides curated Node + httpyac members so `crypto.createHmac` works.
+        // httpyac-lsp: builtins + `.script/` + **relative require('./….js')** modules.
         if script_ctx {
+            let script_text = script_window_text(&lines, line_idx);
+            // Pull require('./….js') + local functions/returns in this {{ }} window.
+            let mut script_catalog = script_catalog.clone();
+            ingest_script_locals(&mut script_catalog, &script_text);
+            let require_bindings = enrich_catalog_from_requires(
+                &mut script_catalog,
+                http_file_dir,
+                &script_text,
+            );
+            let var_types =
+                parse_typed_bindings(&script_text, &mut script_catalog, &require_bindings);
+
             // crypto fluent chain: createHmac/Hash → .update → .digest('base64')
             // Also multi-line: createHmac(...)\n  .|
             // ── Unified member completions (request/response/client/console/crypto/…) ──
@@ -787,10 +878,10 @@ impl LanguageServer for HttpLsp {
                     }
                 }
                 if !items.is_empty() {
-                    return Ok(Some(CompletionResponse::List(CompletionList {
+                    return Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
-                    })));
+                    }));
                 }
             }
 
@@ -799,7 +890,7 @@ impl LanguageServer for HttpLsp {
             {
                 let fl = chain_filter.to_lowercase();
                 let member_start =
-                    member_replace_start(before_cursor, position.character, chain_filter.len());
+                    member_col(before_cursor, chain_filter.len());
 
                 if fl.is_empty() || "update".starts_with(&fl) {
                     let insert = CRYPTO_UPDATE_THEN_DIGEST_SNIPPET.to_string();
@@ -870,10 +961,10 @@ impl LanguageServer for HttpLsp {
                 }
 
                 if !items.is_empty() {
-                    return Ok(Some(CompletionResponse::List(CompletionList {
+                    return Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
-                    })));
+                    }));
                 }
             }
 
@@ -883,6 +974,7 @@ impl LanguageServer for HttpLsp {
                 for (suf, path) in [
                     ("client.global.", "client.global"),
                     ("response.headers.", "response.headers"),
+                    ("request.headers.", "request.headers"),
                     ("response.", "response"),
                     ("request.", "request"),
                     ("client.", "client"),
@@ -901,197 +993,318 @@ impl LanguageServer for HttpLsp {
                         return Some((path.to_string(), String::new()));
                     }
                 }
+                // require-alias: `c.` / `myCrypto.` when const c = require('crypto')
+                for b in &require_bindings {
+                    let suf = format!("{}.", b.name);
+                    if t.ends_with(&suf) {
+                        return Some((b.name.clone(), String::new()));
+                    }
+                }
+                // typed locals: `h.` when const h = crypto.createHmac(...)
+                for vname in var_types.keys() {
+                    let suf = format!("{vname}.");
+                    if t.ends_with(&suf) {
+                        return Some((vname.clone(), String::new()));
+                    }
+                }
+                // Module stems from catalog (builtin + user): `helpers.` `crypto.` …
+                for (stem, _) in script_catalog.module_roots() {
+                    let suf = format!("{stem}.");
+                    if t.ends_with(&suf) {
+                        return Some((stem, String::new()));
+                    }
+                }
                 None
             });
 
-            if let Some((path, filter)) = dotted {
+            if let Some((path_raw, filter)) = dotted {
+                // const c = require('crypto') → c.xxx uses crypto table
+                let path = resolve_path_with_bindings(&path_raw, &require_bindings);
+                // Display path keeps what the user typed (c.createHmac) for Zed filter_text
+                let display_path = path_raw.clone();
                 let filter_l = filter.to_lowercase();
                 let member_start =
-                    member_replace_start(before_cursor, position.character, filter.len());
+                    member_col(before_cursor, filter.len());
 
-                let push_props = |items: &mut Vec<CompletionItem>,
-                                  props: &[(&str, &str)],
-                                  sort_prefix: &str,
-                                  detail_prefix: &str| {
-                    for (name, desc) in props {
-                        if !filter_l.is_empty() && !name.to_lowercase().starts_with(&filter_l) {
-                            continue;
+                // Snippet insert text for well-known method names (editor UX only).
+                let enrich_insert = |name: &str, default: String, is_method: bool| -> (String, bool) {
+                    match name {
+                        "createHmac" => (CRYPTO_CREATE_HMAC_SNIPPET.to_string(), true),
+                        "createHash" => (CRYPTO_CREATE_HASH_SNIPPET.to_string(), true),
+                        "randomBytes" => ("randomBytes(${1:16})".to_string(), true),
+                        "randomUUID" => ("randomUUID()".to_string(), true),
+                        "readFileSync" => {
+                            ("readFileSync(${1:path}, '${2:utf8}')".to_string(), true)
                         }
-                        let (insert, is_snippet) = match *name {
-                            "createHmac" => (CRYPTO_CREATE_HMAC_SNIPPET.to_string(), true),
-                            "createHash" => (CRYPTO_CREATE_HASH_SNIPPET.to_string(), true),
-                            "randomBytes" => ("randomBytes(${1:16})".to_string(), true),
-                            "randomUUID" => ("randomUUID()".to_string(), true),
-                            "readFileSync" => {
-                                ("readFileSync(${1:path}, '${2:utf8}')".to_string(), true)
-                            }
-                            "update" => ("update(${1:data})".to_string(), true),
-                            "digest" => ("digest('${1:base64}')".to_string(), true),
-                            "log" | "error" | "warn" | "info"
-                                if path == "console" =>
-                            {
-                                (format!("{name}($1)"), true)
-                            }
-                            _ => (name.to_string(), false),
-                        };
-                        let (filter_text, label) = member_filter_label(&path, name);
-                        items.push(CompletionItem {
-                            label,
-                            kind: Some(CompletionItemKind::METHOD),
-                            detail: Some(format!("{detail_prefix} — {desc}")),
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: line_num,
-                                        character: member_start,
-                                    },
-                                    end: Position {
-                                        line: line_num,
-                                        character: position.character,
-                                    },
-                                },
-                                new_text: insert.clone(),
-                            })),
-                            insert_text: Some(insert),
-                            insert_text_format: if is_snippet {
-                                Some(InsertTextFormat::SNIPPET)
-                            } else {
-                                Some(InsertTextFormat::PLAIN_TEXT)
-                            },
-                            filter_text: Some(filter_text),
-                            sort_text: Some(format!("{sort_prefix}{name}")),
-                            documentation: Some(Documentation::String(desc.to_string())),
-                            ..Default::default()
-                        });
+                        "update" => ("update(${1:data})".to_string(), true),
+                        "digest" => ("digest('${1:base64}')".to_string(), true),
+                        "log" | "error" | "warn" | "info"
+                            if path == "console" || display_path == "console" =>
+                        {
+                            (format!("{name}($1)"), true)
+                        }
+                        _ if is_method
+                            && default.contains('(') =>
+                        {
+                            (default, true)
+                        }
+                        _ if is_method => (format!("{name}($1)"), true),
+                        _ => (default, false),
                     }
                 };
 
-                match path.as_str() {
-                    "" => {
-                        // bare roots: request / response / client / crypto / …
-                        // commit_characters "." so accept + type dot continues smoothly
-                        let member_roots = [
-                            "request", "response", "client", "console", "crypto", "exports",
-                            "$global", "test", "sleep", "require", "Buffer", "JSON", "Math",
-                        ];
-                        for (name, desc) in SCRIPT_ROOTS {
-                            if filter_l.is_empty() || name.to_lowercase().starts_with(&filter_l) {
-                                let kind = if matches!(
-                                    *name,
-                                    "const" | "let" | "var" | "if" | "for" | "while" | "return"
-                                        | "await" | "async" | "typeof" | "new" | "throw" | "try"
-                                ) {
-                                    CompletionItemKind::KEYWORD
-                                } else if matches!(*name, "require") {
-                                    CompletionItemKind::FUNCTION
+                let push_script_members =
+                    |items: &mut Vec<CompletionItem>,
+                     display: &str,
+                     members: &[ScriptMember],
+                     sort_prefix: &str| {
+                        for m in members {
+                            if !filter_l.is_empty()
+                                && !m.name.to_lowercase().starts_with(&filter_l)
+                            {
+                                continue;
+                            }
+                            let raw = m
+                                .insert
+                                .clone()
+                                .unwrap_or_else(|| m.name.clone());
+                            let (insert, is_snippet) =
+                                enrich_insert(&m.name, raw, m.is_method);
+                            let (filter_text, label) = member_filter_label(display, &m.name);
+                            let detail = if m.source.contains("builtin")
+                                || m.documentation.contains("builtin_script")
+                                || m.source.ends_with(".js")
+                                    && !m.source.contains('/')
+                            {
+                                // builtin_script file names are like request.js
+                                format!("builtin/user script — {}", m.detail)
+                            } else {
+                                format!("script — {}", m.detail)
+                            };
+                            items.push(CompletionItem {
+                                label,
+                                kind: Some(if m.is_method {
+                                    CompletionItemKind::METHOD
                                 } else {
-                                    CompletionItemKind::VARIABLE
-                                };
-                                let commit = if member_roots.contains(name) {
+                                    CompletionItemKind::PROPERTY
+                                }),
+                                detail: Some(detail),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: line_num,
+                                            character: member_start,
+                                        },
+                                        end: Position {
+                                            line: line_num,
+                                            character: position.character,
+                                        },
+                                    },
+                                    new_text: insert.clone(),
+                                })),
+                                insert_text: Some(insert),
+                                insert_text_format: if is_snippet {
+                                    Some(InsertTextFormat::SNIPPET)
+                                } else {
+                                    Some(InsertTextFormat::PLAIN_TEXT)
+                                },
+                                filter_text: Some(filter_text),
+                                sort_text: Some(format!("{sort_prefix}{}", m.name)),
+                                documentation: Some(Documentation::String(
+                                    m.documentation.clone(),
+                                )),
+                                commit_characters: if !m.is_method {
                                     Some(vec![".".to_string()])
                                 } else {
                                     None
-                                };
-                                items.push(CompletionItem {
-                                    label: name.to_string(),
-                                    kind: Some(kind),
-                                    detail: Some(format!("script — {desc}")),
-                                    insert_text: Some(name.to_string()),
-                                    filter_text: Some(name.to_string()),
-                                    sort_text: Some(format!("0{name}")),
-                                    commit_characters: commit,
-                                    documentation: Some(Documentation::String(desc.to_string())),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                        if filter_l.is_empty() || "exports".starts_with(&filter_l) {
-                            items.push(CompletionItem {
-                                label: "exports".to_string(),
-                                kind: Some(CompletionItemKind::VARIABLE),
-                                detail: Some(EXPORTS_NOTE.to_string()),
-                                insert_text: Some("exports".to_string()),
-                                filter_text: Some("exports".to_string()),
-                                sort_text: Some("0exports".to_string()),
-                                commit_characters: Some(vec![".".to_string()]),
-                                documentation: Some(Documentation::String(EXPORTS_NOTE.to_string())),
+                                },
                                 ..Default::default()
                             });
                         }
-                        for (label, detail, body) in SCRIPT_SNIPPETS {
-                            if filter_l.is_empty()
-                                || label.to_lowercase().contains(&filter_l)
-                                || detail.to_lowercase().contains(&filter_l)
+                    };
+
+                if path.is_empty() {
+                    // Keywords / httpyac globals (const, await, test, …)
+                    for (name, desc) in SCRIPT_ROOTS {
+                        if filter_l.is_empty() || name.to_lowercase().starts_with(&filter_l) {
+                            let kind = if matches!(
+                                *name,
+                                "const" | "let" | "var" | "if" | "for" | "while" | "return"
+                                    | "await" | "async" | "typeof" | "new" | "throw" | "try"
+                            ) {
+                                CompletionItemKind::KEYWORD
+                            } else if matches!(*name, "require") {
+                                CompletionItemKind::FUNCTION
+                            } else {
+                                CompletionItemKind::VARIABLE
+                            };
+                            items.push(CompletionItem {
+                                label: name.to_string(),
+                                kind: Some(kind),
+                                detail: Some(format!("script — {desc}")),
+                                insert_text: Some(name.to_string()),
+                                filter_text: Some(name.to_string()),
+                                sort_text: Some(format!("1{name}")),
+                                commit_characters: None,
+                                documentation: Some(Documentation::String(desc.to_string())),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // Builtin + user module roots (request, response, crypto, date-fns, …)
+                    for (stem, detail) in script_catalog.module_roots() {
+                        if filter_l.is_empty() || stem.to_lowercase().starts_with(&filter_l) {
+                            items.push(CompletionItem {
+                                label: stem.clone(),
+                                kind: Some(CompletionItemKind::MODULE),
+                                detail: Some(detail.clone()),
+                                insert_text: Some(stem.clone()),
+                                filter_text: Some(stem.clone()),
+                                sort_text: Some(format!("0{stem}")),
+                                commit_characters: Some(vec![".".to_string()]),
+                                documentation: Some(Documentation::String(format!(
+                                    "`{detail}` — type `{stem}.` for members (user .script overrides builtin)"
+                                ))),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // require() binding names (whole module + destructured exports)
+                    for b in &require_bindings {
+                        if filter_l.is_empty() || b.name.to_lowercase().starts_with(&filter_l) {
+                            let (detail, commit, docs) = if b.maps_to_module {
+                                (
+                                    format!(
+                                        "require('{}') → module `{}`",
+                                        b.raw_path.as_deref().unwrap_or(&b.module),
+                                        b.module
+                                    ),
+                                    Some(vec![".".to_string()]),
+                                    format!(
+                                        "Whole-module binding — type `{}.` for exports from `{}`",
+                                        b.name, b.module
+                                    ),
+                                )
+                            } else {
+                                (
+                                    format!("destructured from `{}`", b.module),
+                                    None,
+                                    format!(
+                                        "Export `{}` from require('{}')",
+                                        b.name,
+                                        b.raw_path.as_deref().unwrap_or(&b.module)
+                                    ),
+                                )
+                            };
+                            items.push(CompletionItem {
+                                label: b.name.clone(),
+                                kind: Some(if b.maps_to_module {
+                                    CompletionItemKind::VARIABLE
+                                } else {
+                                    CompletionItemKind::FUNCTION
+                                }),
+                                detail: Some(detail),
+                                insert_text: Some(b.name.clone()),
+                                filter_text: Some(b.name.clone()),
+                                sort_text: Some(format!("0{}", b.name)),
+                                commit_characters: commit,
+                                documentation: Some(Documentation::String(docs)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // Typed locals: const h = crypto.createHmac(...) → h : Hmac
+                    for (vname, ty) in &var_types {
+                        if filter_l.is_empty() || vname.to_lowercase().starts_with(&filter_l) {
+                            items.push(CompletionItem {
+                                label: vname.clone(),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some(format!(": {ty} (inferred)")),
+                                insert_text: Some(vname.clone()),
+                                filter_text: Some(vname.clone()),
+                                sort_text: Some(format!("0{vname}")),
+                                commit_characters: Some(vec![".".to_string()]),
+                                documentation: Some(Documentation::String(format!(
+                                    "Inferred type `{ty}` from assignment — type `{vname}.` for members"
+                                ))),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    for (label, detail, body) in SCRIPT_SNIPPETS {
+                        if filter_l.is_empty()
+                            || label.to_lowercase().contains(&filter_l)
+                            || detail.to_lowercase().contains(&filter_l)
+                        {
+                            items.push(CompletionItem {
+                                label: label.to_string(),
+                                kind: Some(CompletionItemKind::SNIPPET),
+                                detail: Some(detail.to_string()),
+                                insert_text: Some(body.to_string()),
+                                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                                sort_text: Some(format!("9{label}")),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                } else {
+                    // Member path: modules / path_ext / **inferred var types** (Hmac chain, …)
+                    let resolved = resolve_completion_path(
+                        &path,
+                        &script_catalog,
+                        &require_bindings,
+                        &var_types,
+                    );
+                    let mut script_members = match &resolved {
+                        PathResolve::Type { type_name, rest } => {
+                            script_catalog.members_for_type(type_name, rest)
+                        }
+                        PathResolve::ModulePath(p) => script_catalog.members_for_path(p),
+                    };
+                    if display_path != path {
+                        let disp = resolve_completion_path(
+                            &display_path,
+                            &script_catalog,
+                            &require_bindings,
+                            &var_types,
+                        );
+                        let extra = match disp {
+                            PathResolve::Type { type_name, rest } => {
+                                script_catalog.members_for_type(&type_name, &rest)
+                            }
+                            PathResolve::ModulePath(dp) => script_catalog.members_for_path(&dp),
+                        };
+                        for em in extra {
+                            if let Some(pos) =
+                                script_members.iter().position(|x| x.name == em.name)
                             {
-                                items.push(CompletionItem {
-                                    label: label.to_string(),
-                                    kind: Some(CompletionItemKind::SNIPPET),
-                                    detail: Some(detail.to_string()),
-                                    insert_text: Some(body.to_string()),
-                                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                                    sort_text: Some(format!("9{label}")),
-                                    ..Default::default()
-                                });
+                                script_members[pos] = em;
+                            } else {
+                                script_members.push(em);
                             }
                         }
                     }
-                    "response" => push_props(&mut items, RESPONSE_PROPS, "1", "response"),
-                    "response.headers" => {
-                        push_props(&mut items, RESPONSE_HEADERS_PROPS, "1", "response.headers")
-                    }
-                    "request" => push_props(&mut items, REQUEST_PROPS, "1", "request"),
-                    "client" => push_props(&mut items, CLIENT_PROPS, "1", "client"),
-                    "client.global" => {
-                        push_props(&mut items, CLIENT_GLOBAL_PROPS, "1", "client.global")
-                    }
-                    "JSON" => push_props(&mut items, JSON_PROPS, "1", "JSON"),
-                    "Math" => push_props(&mut items, MATH_PROPS, "1", "Math"),
-                    "Object" => push_props(&mut items, OBJECT_PROPS, "1", "Object"),
-                    "Array" => push_props(&mut items, ARRAY_PROPS, "1", "Array"),
-                    "Date" => push_props(&mut items, DATE_PROPS, "1", "Date"),
-                    "crypto" => push_props(&mut items, CRYPTO_PROPS, "0", "node:crypto"),
-                    "fs" => push_props(&mut items, FS_PROPS, "0", "node:fs"),
-                    "path" => push_props(&mut items, PATH_PROPS, "0", "node:path"),
-                    "Buffer" => push_props(&mut items, BUFFER_STATIC_PROPS, "0", "node:Buffer"),
-                    "console" => {
-                        for name in ["log", "error", "warn", "info"] {
-                            if filter_l.is_empty() || name.starts_with(filter_l.as_str()) {
-                                let (ft, label) = member_filter_label("console", name);
-                                let insert = format!("{name}($1)");
-                                items.push(CompletionItem {
-                                    label,
-                                    kind: Some(CompletionItemKind::METHOD),
-                                    detail: Some("console".to_string()),
-                                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                        range: Range {
-                                            start: Position {
-                                                line: line_num,
-                                                character: member_start,
-                                            },
-                                            end: Position {
-                                                line: line_num,
-                                                character: position.character,
-                                            },
-                                        },
-                                        new_text: insert.clone(),
-                                    })),
-                                    insert_text: Some(insert),
-                                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                                    filter_text: Some(ft),
-                                    sort_text: Some(format!("0{name}")),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
+                    push_script_members(&mut items, &display_path, &script_members, "0");
                 }
 
                 if !items.is_empty() {
-                    return Ok(Some(CompletionResponse::List(CompletionList {
+                    // Dedupe by label — **last wins** (module roots over keywords; user over builtin)
+                    let mut best: std::collections::HashMap<String, CompletionItem> =
+                        std::collections::HashMap::new();
+                    for it in items.drain(..) {
+                        best.insert(it.label.clone(), it);
+                    }
+                    items = best.into_values().collect();
+                    items.sort_by(|a, b| {
+                        a.sort_text
+                            .as_ref()
+                            .unwrap_or(&a.label)
+                            .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+                    });
+                    return Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
-                    })));
+                    }));
                 }
             }
 
@@ -1130,7 +1343,7 @@ impl LanguageServer for HttpLsp {
             }
 
             if !items.is_empty() {
-                return Ok(Some(CompletionResponse::Array(items)));
+                return Some(CompletionResponse::Array(items));
             }
         }
 
@@ -1415,16 +1628,12 @@ impl LanguageServer for HttpLsp {
         }
 
         if items.is_empty() {
-            Ok(None)
+            None
         } else {
-            Ok(Some(CompletionResponse::Array(items)))
+            Some(CompletionResponse::Array(items))
         }
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
-    }
-}
 
 #[tokio::main]
 async fn main() {

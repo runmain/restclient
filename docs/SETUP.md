@@ -148,7 +148,9 @@ Runtime of scripts is always **httpyac CLI**.
 | `base_url is not defined` | Use **httpyac-run** (with `--env`); put `@vars` **before** first `###`; check `activeEnv` |
 | No Switch Environment menu | Reinstall / refresh `tasks.json`; restart Zed |
 | LSP not running | `ls ~/.local/bin/httpyac-lsp`; Server Logs → HTTPyac LSP |
-| No full `crypto.` in `.http` | Move logic to `examples/scripts/*.js` and use vtsls there ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)) |
+| No full `crypto.` in `.http` | Move logic to `examples/scripts/*.js` and use vtsls there ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)), or add APIs under `.script/*.js` ([SCRIPT-EXT.md](./SCRIPT-EXT.md)) |
+| Custom `request.headers.set` / own helpers | Add any `.js` under `.script/` (nested exports + `@httpyac-path`) — [SCRIPT-EXT.md](./SCRIPT-EXT.md) |
+| `const c = require('crypto'); c.` empty | Rebuild/reinstall httpyac-lsp; binding + `.script/crypto.js` merge is supported |
 | vtsls errors on `.http` | Remove `vtsls` from `languages.HTTP.language_servers` |
 
 See also [README.md](../README.md).
