@@ -1,16 +1,18 @@
 //! Child **vtsls** process for script islands inside `.http` buffers.
 //!
 //! This is **not** Zed-managed vtsls (that only attaches to real JS/TS buffers).
-//! httpyac-lsp spawns `@vtsls/language-server` (`vtsls --stdio`), feeds a
-//! **line-aligned virtual `.ts` document**, and forwards completion / hover /
-//! definition so script regions get full TypeScript IntelliSense.
+//! httpyac-lsp can spawn `@vtsls/language-server` (`vtsls --stdio`) **or** use the
+//! built-in script catalog — **mutually exclusive** in script regions (see
+//! [`ScriptCompletionSource`]).
 //!
 //! Configure with (priority high → low):
 //! 1. `lsp.httpyac-lsp.settings.vtslsCommand`
 //! 2. env `HTTPYAC_VTSLS_COMMAND`
 //! 3. `PATH` → `vtsls`
 //!
-//! Disable: `settings.vtslsEnabled: false` or missing binary (falls back to catalog).
+//! Script engine (pick **one**):
+//! - `useBuiltinScriptCompletions: true` (default) → catalog only
+//! - `useBuiltinScriptCompletions: false` / `scriptCompletionSource: "vtsls"` → child vtsls only
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,33 +61,125 @@ declare function require(id: string): any;
 export {};
 "#;
 
-/// User / init settings for the child vtsls.
+/// Which engine answers **script-island** completions (Host / `{{var}}` always catalog).
+/// **Mutually exclusive** — never merge both in one popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptCompletionSource {
+    /// Built-in httpyac catalog (`.script` / `@returns` / require shapes).
+    Builtin,
+    /// Child `@vtsls/language-server` process only.
+    Vtsls,
+}
+
+impl Default for ScriptCompletionSource {
+    fn default() -> Self {
+        // Stable default: curated tips without requiring vtsls.
+        Self::Builtin
+    }
+}
+
+impl ScriptCompletionSource {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "builtin" | "catalog" | "httpyac" | "built-in" | "internal" => Some(Self::Builtin),
+            "vtsls" | "ts" | "typescript" | "external" => Some(Self::Vtsls),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Vtsls => "vtsls",
+        }
+    }
+}
+
+/// User / init settings for script completion + child vtsls.
 #[derive(Debug, Clone)]
 pub struct VtslsSettings {
+    /// When `source == Vtsls`, allow spawning the child (false → force builtin).
     pub enabled: bool,
+    /// Script-region engine: **builtin XOR vtsls** (not both).
+    pub source: ScriptCompletionSource,
     /// Absolute or PATH command, e.g. `/…/bin/vtsls`.
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// True if `source` was set explicitly in the last `from_json` (for merge).
+    source_explicit: bool,
+    enabled_explicit: bool,
 }
 
 impl Default for VtslsSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            source: ScriptCompletionSource::Builtin,
             command: None,
             args: vec!["--stdio".into()],
+            source_explicit: false,
+            enabled_explicit: false,
         }
     }
 }
 
 impl VtslsSettings {
+    /// Effective engine for script islands (applies `vtslsEnabled: false` → builtin).
+    pub fn script_source(&self) -> ScriptCompletionSource {
+        if !self.enabled {
+            return ScriptCompletionSource::Builtin;
+        }
+        self.source
+    }
+
     /// Merge JSON from `initializationOptions` or `lsp.httpyac-lsp.settings`.
     pub fn from_json(v: &Value) -> Self {
         let mut s = Self::default();
-        if let Some(b) = v.get("vtslsEnabled").and_then(|x| x.as_bool()) {
+
+        if let Some(b) = v
+            .get("vtslsEnabled")
+            .or_else(|| v.get("vtsls_enabled"))
+            .and_then(|x| x.as_bool())
+        {
             s.enabled = b;
+            s.enabled_explicit = true;
         }
-        // camelCase + snake_case
+
+        // Explicit source string (preferred)
+        for key in [
+            "scriptCompletionSource",
+            "script_completion_source",
+            "scriptEngine",
+            "script_engine",
+        ] {
+            if let Some(raw) = v.get(key).and_then(|x| x.as_str()) {
+                if let Some(src) = ScriptCompletionSource::parse(raw) {
+                    s.source = src;
+                    s.source_explicit = true;
+                    break;
+                }
+            }
+        }
+
+        // Boolean: whether to use **built-in** catalog (user-facing name)
+        for key in [
+            "useBuiltinScriptCompletions",
+            "use_builtin_script_completions",
+            "useBuiltinScript",
+            "use_builtin_script",
+        ] {
+            if let Some(b) = v.get(key).and_then(|x| x.as_bool()) {
+                s.source = if b {
+                    ScriptCompletionSource::Builtin
+                } else {
+                    ScriptCompletionSource::Vtsls
+                };
+                s.source_explicit = true;
+                break;
+            }
+        }
+
+        // camelCase + snake_case command
         for key in ["vtslsCommand", "vtsls_command"] {
             if let Some(c) = v.get(key).and_then(|x| x.as_str()) {
                 let c = c.trim();
@@ -110,12 +204,18 @@ impl VtslsSettings {
         if other.command.is_some() {
             self.command = other.command.clone();
         }
-        // enabled: explicit false wins if other set from json with false
-        self.enabled = other.enabled;
-        if other.args != vec!["--stdio".to_string()] || self.args.is_empty() {
-            if !other.args.is_empty() {
-                self.args = other.args.clone();
-            }
+        if other.enabled_explicit {
+            self.enabled = other.enabled;
+            self.enabled_explicit = true;
+        }
+        if other.source_explicit {
+            self.source = other.source;
+            self.source_explicit = true;
+        }
+        if !other.args.is_empty()
+            && (other.args != vec!["--stdio".to_string()] || self.args.is_empty())
+        {
+            self.args = other.args.clone();
         }
     }
 }
@@ -874,6 +974,11 @@ impl VtslsBridge {
         s.merge_from(&parsed);
     }
 
+    /// Current script completion engine (builtin | vtsls).
+    pub async fn script_source(&self) -> ScriptCompletionSource {
+        self.settings.lock().await.script_source()
+    }
+
     pub async fn ensure_started(
         &self,
         client: &Client,
@@ -881,6 +986,10 @@ impl VtslsBridge {
     ) -> Option<()> {
         {
             let s = self.settings.lock().await;
+            // Only spawn when user chose vtsls engine
+            if s.script_source() != ScriptCompletionSource::Vtsls {
+                return None;
+            }
             if !s.enabled {
                 return None;
             }
@@ -1003,6 +1112,33 @@ Host: x
         let s = VtslsSettings::from_json(&v);
         assert_eq!(s.command.as_deref(), Some("/bin/vtsls"));
         assert!(s.enabled);
+        // default engine remains builtin unless toggled
+        assert_eq!(s.script_source(), ScriptCompletionSource::Builtin);
+    }
+
+    #[test]
+    fn settings_use_builtin_flag_and_source_string() {
+        let builtin = VtslsSettings::from_json(&json!({
+            "useBuiltinScriptCompletions": true
+        }));
+        assert_eq!(builtin.script_source(), ScriptCompletionSource::Builtin);
+
+        let vtsls = VtslsSettings::from_json(&json!({
+            "useBuiltinScriptCompletions": false,
+            "vtslsCommand": "/bin/vtsls"
+        }));
+        assert_eq!(vtsls.script_source(), ScriptCompletionSource::Vtsls);
+
+        let by_str = VtslsSettings::from_json(&json!({
+            "scriptCompletionSource": "vtsls"
+        }));
+        assert_eq!(by_str.script_source(), ScriptCompletionSource::Vtsls);
+
+        let disabled = VtslsSettings::from_json(&json!({
+            "scriptCompletionSource": "vtsls",
+            "vtslsEnabled": false
+        }));
+        assert_eq!(disabled.script_source(), ScriptCompletionSource::Builtin);
     }
 }
 

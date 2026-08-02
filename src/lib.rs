@@ -144,6 +144,19 @@ impl zed::Extension for HttpyacClientExtension {
         if !map.contains_key("vtslsEnabled") {
             map.insert("vtslsEnabled".into(), serde_json::Value::Bool(true));
         }
+        // Default script engine = builtin catalog (mutex with vtsls)
+        if !map.contains_key("useBuiltinScriptCompletions")
+            && !map.contains_key("scriptCompletionSource")
+        {
+            map.insert(
+                "useBuiltinScriptCompletions".into(),
+                serde_json::Value::Bool(true),
+            );
+            map.insert(
+                "scriptCompletionSource".into(),
+                serde_json::Value::String("builtin".into()),
+            );
+        }
         if map.is_empty() {
             Ok(None)
         } else {

@@ -104,7 +104,9 @@ print_manual_json_block() {
       },
       "settings": {
         "vtslsCommand": "$VTSLS_PATH",
-        "vtslsEnabled": true
+        "vtslsEnabled": true,
+        "useBuiltinScriptCompletions": true,
+        "scriptCompletionSource": "builtin"
       }
     }
   },
@@ -379,7 +381,7 @@ if [[ -z "$VTSLS_PATH" ]]; then
     "" \
     "装好后可写入 settings（或重跑本脚本）：" \
     "  \"httpyac\": { \"vtsls_command\": \"\$(which vtsls)\" }" \
-    "  \"lsp\": { \"httpyac-lsp\": { \"settings\": { \"vtslsCommand\": \"\$(which vtsls)\", \"vtslsEnabled\": true } } }"
+    "  \"lsp\": { \"httpyac-lsp\": { \"settings\": { \"vtslsCommand\": \"\$(which vtsls)\", \"useBuiltinScriptCompletions\": true } } }"
   WARNINGS+=("未找到 vtsls — script 区将回退到 catalog 提示")
   MANUAL_REQUIRED+=("安装 vtsls：npm install -g @vtsls/language-server（script 完整补全）")
 else
@@ -495,6 +497,10 @@ setp(["lsp", "httpyac-lsp", "binary", "path"], lsp, force_update=True)
 setp(["lsp", "httpyac-lsp", "binary", "arguments"], [], force_update=False)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsCommand"], vtsls, force_update=True)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsEnabled"], True, force_update=False)
+# Script tips: builtin XOR vtsls (default builtin — stable httpyac shapes)
+setp(["lsp", "httpyac-lsp", "settings", "useBuiltinScriptCompletions"], True, force_update=False)
+setp(["lsp", "httpyac-lsp", "settings", "scriptCompletionSource"], "builtin", force_update=False)
+setp(["httpyac", "use_builtin_script_completions"], True, force_update=False)
 
 if not changed:
     print("UP_TO_DATE")

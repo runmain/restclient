@@ -163,7 +163,9 @@ Optional. Works without it if PATH is correct.
       },
       "settings": {
         "vtslsCommand": "/absolute/path/to/vtsls",
-        "vtslsEnabled": true
+        "vtslsEnabled": true,
+        "useBuiltinScriptCompletions": true,
+        "scriptCompletionSource": "builtin"
       }
     }
   },
@@ -190,11 +192,14 @@ which vtsls && vtsls --version
 |-----|---------|
 | `httpyac.command` | Path to httpyac CLI |
 | `httpyac.lsp_command` | Path to httpyac-lsp |
-| `httpyac.vtsls_command` | Path to `vtsls` (`@vtsls/language-server`) for script islands |
+| `httpyac.vtsls_command` | Path to `vtsls` binary (only used when script engine = vtsls) |
+| `httpyac.use_builtin_script_completions` | `true` (default) = **builtin catalog only** in `{{ }}`; `false` = **vtsls only** |
 | `httpyac.default_env` | Docs/default name; runtime uses JSON `activeEnv` |
 | `lsp.httpyac-lsp.binary.path` | Binary Zed uses to start the LSP |
-| `lsp.httpyac-lsp.settings.vtslsCommand` | Same as `httpyac.vtsls_command` (preferred by LSP) |
-| `lsp.httpyac-lsp.settings.vtslsEnabled` | `false` disables child vtsls (catalog-only scripts) |
+| `lsp.httpyac-lsp.settings.vtslsCommand` | Same as `httpyac.vtsls_command` |
+| `lsp.httpyac-lsp.settings.useBuiltinScriptCompletions` | **Mutex** with vtsls: `true` → catalog, `false` → child vtsls (not both) |
+| `lsp.httpyac-lsp.settings.scriptCompletionSource` | `"builtin"` \| `"vtsls"` (same choice, explicit) |
+| `lsp.httpyac-lsp.settings.vtslsEnabled` | `false` forces builtin even if source is vtsls |
 | `languages.HTTP.language_servers` | Must include **only** `httpyac-lsp` (do **not** add Zed’s `vtsls` on HTTP) |
 | `languages.HTTP.completions.words` | `fallback` = word list only if LSP has no results (avoids “Hello” hiding **Host**) |
 | `languages.HTTP.completions.words_min_length` | Min chars for word completions (use ≥3) |
