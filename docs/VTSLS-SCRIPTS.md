@@ -2,14 +2,18 @@
 
 ## Goal
 
-| Want | Where it works in Zed today |
-|------|-----------------------------|
-| Complete Node API, any variable name, types | **`.js` / `.ts` files** + **vtsls** |
-| Send request / `{{vars}}` / env / thin glue | **`.http`** + **httpyac-lsp** only |
+| Want | Where it works |
+|------|----------------|
+| Complete Node API on a **real** `.js` / `.ts` buffer | **Zed-managed vtsls** (open the file) |
+| Complete Node/TS **inside** `.http` `{{ }}` / handlers | **httpyac-lsp child vtsls** (`vtsls --stdio`, configured path) |
+| Send request / `{{vars}}` / env / HTTP lines | **httpyac-lsp** only (never put Zed `vtsls` on `languages.HTTP`) |
 
-Zed attaches language servers to the **buffer language**. An `.http` file is language **HTTP** → only `httpyac-lsp`. Putting `vtsls` on `languages.HTTP` makes vtsls parse the whole file as TS and **breaks** script completions.
+Zed attaches language servers to the **buffer language**. Listing editor `vtsls` under HTTP still breaks `GET` lines.
 
-There is **no** stable “vtsls only on `{{ }}` islands” yet.
+**Script-region path (this branch):** install `@vtsls/language-server`, set `httpyac.vtsls_command` /
+`lsp.httpyac-lsp.settings.vtslsCommand`. httpyac-lsp spawns that binary, feeds a virtual `.ts`
+document for script islands, and forwards completion / hover / definition. This is a **private**
+vtsls process (not Zed’s language-server UI entry) — see [VTSLS-MULTI-LSP-REVIEW.md](./VTSLS-MULTI-LSP-REVIEW.md).
 
 ## Recommended layout
 

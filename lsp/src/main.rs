@@ -13,6 +13,7 @@ use httpyac_lsp::script_ext::{
     ScriptCatalog, ScriptCatalogCache, ScriptMember,
 };
 use httpyac_lsp::variables::VariableResolver;
+use httpyac_lsp::vtsls_proxy::VtslsBridge;
 use httpyac_lsp::{collect_env_names, resolve_httpyac_bin};
 
 use std::collections::HashMap;
@@ -65,12 +66,13 @@ struct Document {
     requests: Vec<HttpRequest>,
 }
 
-#[derive(Debug)]
 struct HttpLsp {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
     /// Cached parse of nearest `.script/*.js` (any files the user adds).
     script_catalog: Arc<Mutex<ScriptCatalogCache>>,
+    /// Optional child vtsls for full TS IntelliSense inside script regions.
+    vtsls: Arc<VtslsBridge>,
 }
 
 impl HttpLsp {
@@ -79,7 +81,19 @@ impl HttpLsp {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             script_catalog: Arc::new(Mutex::new(ScriptCatalogCache::default())),
+            vtsls: Arc::new(VtslsBridge::new()),
         }
+    }
+
+    fn workspace_root_for(uri: &Url) -> Option<PathBuf> {
+        uri.to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    async fn ensure_vtsls(&self, uri: &Url) {
+        let root = Self::workspace_root_for(uri);
+        self.vtsls.ensure_started(&self.client, root).await;
     }
 
     /// Builtin + user `.script/` catalog for this HTTP file’s directory.
@@ -395,7 +409,25 @@ fn resolve_runner_bin() -> String {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for HttpLsp {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // initializationOptions + env HTTPYAC_VTSLS_COMMAND
+        if let Some(opts) = params.initialization_options.as_ref() {
+            self.vtsls.apply_settings_json(opts).await;
+        }
+        // Seed command from env if not set
+        {
+            let mut s = self.vtsls.settings.lock().await;
+            if s.command.is_none() {
+                if let Ok(e) = std::env::var("HTTPYAC_VTSLS_COMMAND") {
+                    let e = e.trim();
+                    if !e.is_empty() {
+                        s.command = Some(e.to_string());
+                    }
+                }
+            }
+            let _ = s;
+        }
+        let _ = params;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -413,6 +445,8 @@ impl LanguageServer for HttpLsp {
                     ),
                     ..Default::default()
                 }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -421,8 +455,54 @@ impl LanguageServer for HttpLsp {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "HTTP LSP initialized")
+            .log_message(
+                MessageType::INFO,
+                "HTTP LSP initialized (script vtsls proxy optional)",
+            )
             .await;
+        // Pull lsp.httpyac-lsp.settings from the editor when supported
+        if let Ok(cfgs) = self
+            .client
+            .configuration(vec![ConfigurationItem {
+                scope_uri: None,
+                section: Some("".into()),
+            }])
+            .await
+        {
+            for cfg in cfgs {
+                if !cfg.is_null() {
+                    self.vtsls.apply_settings_json(&cfg).await;
+                }
+            }
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if !params.settings.is_null() {
+            // Zed may send full settings or just lsp.httpyac-lsp.settings
+            if let Some(lsp) = params.settings.get("lsp").and_then(|l| l.get("httpyac-lsp")) {
+                if let Some(s) = lsp.get("settings") {
+                    self.vtsls.apply_settings_json(s).await;
+                }
+            }
+            if let Some(h) = params.settings.get("httpyac") {
+                // httpyac.vtsls_command top-level convenience key
+                let mut mapped = serde_json::Map::new();
+                if let Some(c) = h.get("vtsls_command").or_else(|| h.get("vtslsCommand")) {
+                    mapped.insert("vtslsCommand".into(), c.clone());
+                }
+                if let Some(e) = h.get("vtsls_enabled").or_else(|| h.get("vtslsEnabled")) {
+                    mapped.insert("vtslsEnabled".into(), e.clone());
+                }
+                if !mapped.is_empty() {
+                    self.vtsls
+                        .apply_settings_json(&serde_json::Value::Object(mapped))
+                        .await;
+                }
+            }
+            // Direct settings object
+            self.vtsls.apply_settings_json(&params.settings).await;
+        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -431,6 +511,8 @@ impl LanguageServer for HttpLsp {
         let version = params.text_document.version;
 
         let requests = parse_http_file(&content).unwrap_or_default();
+        self.ensure_vtsls(&uri).await;
+        self.vtsls.sync(&uri, &content).await;
         let doc = Document {
             content,
             version,
@@ -446,6 +528,8 @@ impl LanguageServer for HttpLsp {
 
         if let Some(change) = params.content_changes.into_iter().last() {
             let requests = parse_http_file(&change.text).unwrap_or_default();
+            self.ensure_vtsls(&uri).await;
+            self.vtsls.sync(&uri, &change.text).await;
             let doc = Document {
                 content: change.text,
                 version,
@@ -457,6 +541,7 @@ impl LanguageServer for HttpLsp {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.vtsls.close(&params.text_document.uri).await;
         let mut docs = self.documents.write().await;
         docs.remove(&params.text_document.uri);
     }
@@ -537,7 +622,81 @@ impl LanguageServer for HttpLsp {
         }
     }
 
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let (content, script_ctx) = {
+            let docs = self.documents.read().await;
+            let Some(doc) = docs.get(uri) else {
+                return Ok(None);
+            };
+            let lines: Vec<&str> = doc.content.lines().collect();
+            let line_idx = position.line as usize;
+            let line = lines.get(line_idx).copied().unwrap_or("");
+            let col = lsp_utf16_to_byte(line, position.character);
+            let before = &line[..col.min(line.len())];
+            let ctx = in_script_context(&lines, line_idx, before);
+            (doc.content.clone(), ctx)
+        };
+        if !script_ctx {
+            return Ok(None);
+        }
+        self.ensure_vtsls(uri).await;
+        self.vtsls.sync(uri, &content).await;
+        let proxy = self.vtsls.proxy.lock().await;
+        if let Some(p) = proxy.as_ref() {
+            match p.hover(uri, position).await {
+                Ok(h) => return Ok(h),
+                Err(e) => {
+                    self.client
+                        .log_message(MessageType::WARNING, format!("vtsls hover: {e}"))
+                        .await;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let (content, script_ctx) = {
+            let docs = self.documents.read().await;
+            let Some(doc) = docs.get(uri) else {
+                return Ok(None);
+            };
+            let lines: Vec<&str> = doc.content.lines().collect();
+            let line_idx = position.line as usize;
+            let line = lines.get(line_idx).copied().unwrap_or("");
+            let col = lsp_utf16_to_byte(line, position.character);
+            let before = &line[..col.min(line.len())];
+            let ctx = in_script_context(&lines, line_idx, before);
+            (doc.content.clone(), ctx)
+        };
+        if !script_ctx {
+            return Ok(None);
+        }
+        self.ensure_vtsls(uri).await;
+        self.vtsls.sync(uri, &content).await;
+        let proxy = self.vtsls.proxy.lock().await;
+        if let Some(p) = proxy.as_ref() {
+            match p.goto_definition(uri, position).await {
+                Ok(d) => return Ok(d),
+                Err(e) => {
+                    self.client
+                        .log_message(MessageType::WARNING, format!("vtsls definition: {e}"))
+                        .await;
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn shutdown(&self) -> Result<()> {
+        *self.vtsls.proxy.lock().await = None;
         Ok(())
     }
 }
@@ -562,6 +721,85 @@ impl HttpLsp {
         };
         if content.is_empty() {
             return Ok(None);
+        }
+
+        // Script-region: try child vtsls first (async; full TS IntelliSense).
+        {
+            let lines: Vec<&str> = content.split('\n').collect();
+            let line_idx = position.line as usize;
+            if line_idx < lines.len() {
+                let current_line = lines[line_idx];
+                let col = lsp_utf16_to_byte(current_line, position.character);
+                let before_cursor = &current_line[..col.min(current_line.len())];
+                if in_script_context(&lines, line_idx, before_cursor) {
+                    self.ensure_vtsls(&uri).await;
+                    self.vtsls.sync(&uri, &content).await;
+                    let vtsls_items = {
+                        let proxy = self.vtsls.proxy.lock().await;
+                        if let Some(p) = proxy.as_ref() {
+                            match p
+                                .completion(&uri, position, params.context.clone())
+                                .await
+                            {
+                                Ok(Some(CompletionResponse::Array(items))) if !items.is_empty() => {
+                                    Some(items)
+                                }
+                                Ok(Some(CompletionResponse::List(list)))
+                                    if !list.items.is_empty() =>
+                                {
+                                    Some(list.items)
+                                }
+                                Ok(_) => None,
+                                Err(e) => {
+                                    self.client
+                                        .log_message(
+                                            MessageType::WARNING,
+                                            format!("vtsls completion: {e}"),
+                                        )
+                                        .await;
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mut items) = vtsls_items {
+                        let labels: std::collections::HashSet<_> =
+                            items.iter().map(|i| i.label.clone()).collect();
+                        let partial = before_cursor
+                            .rsplit(|c: char| {
+                                !c.is_ascii_alphanumeric() && c != '_' && c != '$'
+                            })
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !before_cursor.contains('.') {
+                            for (root, desc) in SCRIPT_ROOTS {
+                                if labels.contains(*root) {
+                                    continue;
+                                }
+                                if !partial.is_empty() && !root.starts_with(partial) {
+                                    continue;
+                                }
+                                items.push(CompletionItem {
+                                    label: (*root).to_string(),
+                                    kind: Some(CompletionItemKind::VARIABLE),
+                                    detail: Some(format!("httpyac global — {desc}")),
+                                    insert_text: Some((*root).to_string()),
+                                    sort_text: Some(format!("1{root}")),
+                                    commit_characters: Some(vec![".".into()]),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        return Ok(Some(CompletionResponse::List(CompletionList {
+                            is_incomplete: true,
+                            items,
+                        })));
+                    }
+                }
+            }
         }
 
         let catalog = self.catalog_for_uri(&uri).await;
@@ -837,8 +1075,7 @@ fn completion_sync(
         let script_ctx = in_script_context(&lines, line_idx, before_cursor);
 
         // --- httpyac / JS script: response. client. crypto. require( … ---
-        // Full vtsls/tsserver cannot attach to injected script islands in .http (Zed limit).
-        // httpyac-lsp: builtins + `.script/` + **relative require('./….js')** modules.
+        // Catalog path (vtsls is attempted asynchronously in completion_inner first).
         if script_ctx {
             let script_text = script_window_text(&lines, line_idx);
             // Pull require('./….js') + local functions/returns in this {{ }} window.

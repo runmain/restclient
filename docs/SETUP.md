@@ -148,9 +148,9 @@ Runtime of scripts is always **httpyac CLI**.
 | `base_url is not defined` | Use **httpyac-run** (with `--env`); put `@vars` **before** first `###`; check `activeEnv` |
 | No Switch Environment menu | Reinstall / refresh `tasks.json`; restart Zed |
 | LSP not running | `ls ~/.local/bin/httpyac-lsp`; Server Logs → HTTPyac LSP |
-| No full `crypto.` in `.http` | Move logic to `examples/scripts/*.js` and use vtsls there ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)), or add APIs under `.script/*.js` ([SCRIPT-EXT.md](./SCRIPT-EXT.md)) |
+| No full `crypto.` in `.http` script | `npm i -g @vtsls/language-server`, set `httpyac.vtsls_command` / re-run `./install_to_zed.sh`; or move logic to `.js` ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)) / `.script` ([SCRIPT-EXT.md](./SCRIPT-EXT.md)) |
 | Custom `request.headers.set` / own helpers | Add any `.js` under `.script/` (nested exports + `@httpyac-path`) — [SCRIPT-EXT.md](./SCRIPT-EXT.md) |
-| `const c = require('crypto'); c.` empty | Rebuild/reinstall httpyac-lsp; binding + `.script/crypto.js` merge is supported |
-| vtsls errors on `.http` | Remove `vtsls` from `languages.HTTP.language_servers` |
+| `const c = require('crypto'); c.` empty | Ensure vtsls installed + `vtslsEnabled`; check Server Logs for “script-region vtsls ready” |
+| vtsls errors on `.http` | Remove **Zed** `vtsls` from `languages.HTTP.language_servers` (keep only `httpyac-lsp`; child vtsls is separate) |
 
 See also [README.md](../README.md).

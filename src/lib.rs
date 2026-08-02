@@ -21,6 +21,26 @@ impl HttpyacClientExtension {
             env.push(("HTTPYAC_BIN".to_string(), httpyac));
         }
 
+        // Child vtsls for script-region IntelliSense (httpyac-lsp spawns it).
+        // Priority: lsp.httpyac-lsp.settings.vtslsCommand → PATH vtsls
+        let mut vtsls_from_settings: Option<String> = None;
+        if let Ok(settings) = LspSettings::for_worktree(language_server_id.as_ref(), worktree) {
+            if let Some(s) = settings.settings.as_ref() {
+                for key in ["vtslsCommand", "vtsls_command"] {
+                    if let Some(c) = s.get(key).and_then(|v| v.as_str()) {
+                        let c = c.trim();
+                        if !c.is_empty() {
+                            vtsls_from_settings = Some(c.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(v) = vtsls_from_settings.or_else(|| worktree.which("vtsls")) {
+            env.push(("HTTPYAC_VTSLS_COMMAND".to_string(), v));
+        }
+
         // 1) settings override
         if let Ok(settings) = LspSettings::for_worktree(language_server_id.as_ref(), worktree) {
             if let Some(binary) = settings.binary {
@@ -102,10 +122,33 @@ impl zed::Extension for HttpyacClientExtension {
 
     fn language_server_initialization_options(
         &mut self,
-        _language_server_id: &LanguageServerId,
-        _worktree: &zed::Worktree,
+        language_server_id: &LanguageServerId,
+        worktree: &zed::Worktree,
     ) -> Result<Option<serde_json::Value>> {
-        Ok(None)
+        let mut map = serde_json::Map::new();
+        // Seed vtsls path for script-region proxy
+        if let Ok(settings) = LspSettings::for_worktree(language_server_id.as_ref(), worktree) {
+            if let Some(s) = settings.settings {
+                if let Some(obj) = s.as_object() {
+                    for (k, v) in obj {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        if !map.contains_key("vtslsCommand") && !map.contains_key("vtsls_command") {
+            if let Some(v) = worktree.which("vtsls") {
+                map.insert("vtslsCommand".into(), serde_json::Value::String(v));
+            }
+        }
+        if !map.contains_key("vtslsEnabled") {
+            map.insert("vtslsEnabled".into(), serde_json::Value::Bool(true));
+        }
+        if map.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(serde_json::Value::Object(map)))
+        }
     }
 
     fn language_server_workspace_configuration(

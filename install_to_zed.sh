@@ -11,7 +11,11 @@ OK_WASM=0
 OK_GRAMMAR=0
 OK_EXT=0
 OK_HTTPYAC=0
+OK_VTSLS=0
 OK_SETTINGS="跳过"
+VTSLS_PATH="vtsls"
+HTTPYAC_PATH="httpyac"
+LSP_PATH=""
 WARNINGS=()
 # 需要用户手动操作的条目（最终「必做/选做」清单）
 MANUAL_REQUIRED=()   # 不处理可能影响使用
@@ -89,6 +93,7 @@ print_manual_json_block() {
   "httpyac": {
     "command": "$HTTPYAC_PATH",
     "lsp_command": "$LSP_PATH",
+    "vtsls_command": "$VTSLS_PATH",
     "default_env": "dev"
   },
   "lsp": {
@@ -96,6 +101,10 @@ print_manual_json_block() {
       "binary": {
         "path": "$LSP_PATH",
         "arguments": []
+      },
+      "settings": {
+        "vtslsCommand": "$VTSLS_PATH",
+        "vtslsEnabled": true
       }
     }
   },
@@ -304,9 +313,9 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5) 探测 httpyac / httpyac-lsp
+# 5) 探测 httpyac / httpyac-lsp / vtsls
 # ---------------------------------------------------------------------------
-echo "【6/7】探测 httpyac / httpyac-lsp 路径..."
+echo "【6/7】探测 httpyac / httpyac-lsp / vtsls 路径..."
 HTTPYAC_PATH="$(command -v httpyac 2>/dev/null || true)"
 if [[ -z "$HTTPYAC_PATH" ]]; then
   HTTPYAC_PATH="httpyac"
@@ -338,6 +347,44 @@ if [[ -x "$LOCAL_BIN/httpyac-run" ]]; then
 else
   echo "  ⚠️  httpyac-run 未安装"
   WARNINGS+=("httpyac-run 缺失，Send 按钮可能失败")
+fi
+
+# vtsls = @vtsls/language-server（script 区内完整 TS/Node IntelliSense）
+OK_VTSLS=0
+VTSLS_PATH="$(command -v vtsls 2>/dev/null || true)"
+if [[ -z "$VTSLS_PATH" ]]; then
+  # common npm global layouts
+  for cand in \
+    "${NPM_CONFIG_PREFIX:-}/bin/vtsls" \
+    "$(npm root -g 2>/dev/null)/../bin/vtsls" \
+    "$HOME/.local/bin/vtsls"
+  do
+    if [[ -n "$cand" && -x "$cand" ]]; then
+      VTSLS_PATH="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "$VTSLS_PATH" ]]; then
+  VTSLS_PATH="vtsls"
+  print_manual_box "安装 vtsls（.http script 区完整 TS 补全需要）" \
+    "原因：当前 PATH 中找不到 vtsls（@vtsls/language-server）" \
+    "说明：httpyac-lsp 会在 {{ }} / script 内启动子进程 vtsls --stdio" \
+    "" \
+    "请执行：" \
+    "  npm install -g @vtsls/language-server" \
+    "" \
+    "然后验证：" \
+    "  which vtsls && vtsls --version" \
+    "" \
+    "装好后可写入 settings（或重跑本脚本）：" \
+    "  \"httpyac\": { \"vtsls_command\": \"\$(which vtsls)\" }" \
+    "  \"lsp\": { \"httpyac-lsp\": { \"settings\": { \"vtslsCommand\": \"\$(which vtsls)\", \"vtslsEnabled\": true } } }"
+  WARNINGS+=("未找到 vtsls — script 区将回退到 catalog 提示")
+  MANUAL_REQUIRED+=("安装 vtsls：npm install -g @vtsls/language-server（script 完整补全）")
+else
+  echo "  ✅ vtsls      = $VTSLS_PATH"
+  OK_VTSLS=1
 fi
 echo ""
 
@@ -384,7 +431,7 @@ else
   mkdir -p "$(dirname "$ZED_SETTINGS")"
   if command -v python3 >/dev/null 2>&1; then
     SET_OUT="$(
-    HTTPYAC_PATH="$HTTPYAC_PATH" LSP_PATH="$LSP_PATH" \
+    HTTPYAC_PATH="$HTTPYAC_PATH" LSP_PATH="$LSP_PATH" VTSLS_PATH="$VTSLS_PATH" \
       FORCE_ZED_SETTINGS="${FORCE_ZED_SETTINGS:-0}" \
       python3 - "$ZED_SETTINGS" <<'PY'
 import json, os, re, shutil, sys, time
@@ -393,6 +440,7 @@ from copy import deepcopy
 path = sys.argv[1]
 httpyac = os.environ.get("HTTPYAC_PATH", "httpyac")
 lsp = os.environ.get("LSP_PATH", os.path.expanduser("~/.local/bin/httpyac-lsp"))
+vtsls = os.environ.get("VTSLS_PATH", "vtsls")
 force = os.environ.get("FORCE_ZED_SETTINGS", "0") == "1"
 
 existed = os.path.isfile(path) and os.path.getsize(path) > 0
@@ -441,9 +489,12 @@ setp(["languages", "HTTP", "completions", "words"], "fallback", force_update=Tru
 setp(["languages", "HTTP", "completions", "words_min_length"], 3, force_update=True)
 setp(["httpyac", "command"], httpyac, force_update=True)
 setp(["httpyac", "lsp_command"], lsp, force_update=True)
+setp(["httpyac", "vtsls_command"], vtsls, force_update=True)
 setp(["httpyac", "default_env"], "dev", force_update=False)
 setp(["lsp", "httpyac-lsp", "binary", "path"], lsp, force_update=True)
 setp(["lsp", "httpyac-lsp", "binary", "arguments"], [], force_update=False)
+setp(["lsp", "httpyac-lsp", "settings", "vtslsCommand"], vtsls, force_update=True)
+setp(["lsp", "httpyac-lsp", "settings", "vtslsEnabled"], True, force_update=False)
 
 if not changed:
     print("UP_TO_DATE")
@@ -539,12 +590,14 @@ echo "  ├─ WASM 扩展编译       $([ "$OK_WASM" -eq 1 ] && echo '✅ 成�
 echo "  ├─ 语法文件            $([ "$OK_GRAMMAR" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
 echo "  ├─ 安装到 Zed 扩展目录 $([ "$OK_EXT" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
 echo "  ├─ httpyac CLI         $([ "$OK_HTTPYAC" -eq 1 ] && echo '✅ 已找到' || echo '⚠️  未找到（发请求前需安装）')"
+echo "  ├─ vtsls (script TS)   $([ "${OK_VTSLS:-0}" -eq 1 ] && echo '✅ 已找到' || echo '⚠️  未找到（script 完整补全需安装）')"
 echo "  └─ settings.json       $OK_SETTINGS"
 echo ""
 echo "  安装位置："
 echo "  ├─ 扩展：$INSTALL_DIR"
 echo "  ├─ LSP ：$LSP_PATH"
-echo "  └─ httpyac：$HTTPYAC_PATH"
+echo "  ├─ httpyac：$HTTPYAC_PATH"
+echo "  └─ vtsls：$VTSLS_PATH"
 echo ""
 
 if [[ ${#WARNINGS[@]} -gt 0 ]]; then

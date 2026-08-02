@@ -7,6 +7,7 @@ pub mod completions;
 pub mod parser;
 pub mod script_ext;
 pub mod variables;
+pub mod vtsls_proxy;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -34,8 +34,8 @@ Send path:
 | `Host`, `{{base_url}}`, `client.global`, `response.` | **httpyac-lsp** (this extension) |
 | JS keywords / `JSON.` / `require('crypto')` module names in scripts | **httpyac-lsp** (curated list, not full Node types) |
 | Script `request.` / `client.` (thin hints) | **httpyac-lsp** only on HTTP |
-| **Full** Node/`crypto` IntelliSense (true vtsls) | **`.js`/`.ts` modules** — see [docs/VTSLS-SCRIPTS.md](docs/VTSLS-SCRIPTS.md) + `examples/script-vtsls.http` |
-| **Multi-LSP / in-buffer vtsls proxy?** | Not supported as islands today — analysis on branch `vtsls`: [docs/VTSLS-MULTI-LSP-REVIEW.md](docs/VTSLS-MULTI-LSP-REVIEW.md) |
+| **Full** Node/`crypto` in **`.js`** (Zed-managed vtsls) | Open real modules — [docs/VTSLS-SCRIPTS.md](docs/VTSLS-SCRIPTS.md) |
+| **Full** TS IntelliSense **inside** `.http` `{{ }}` scripts | Child **vtsls** via httpyac-lsp — install `@vtsls/language-server`, set `httpyac.vtsls_command` ([docs/VTSLS-MULTI-LSP-REVIEW.md](docs/VTSLS-MULTI-LSP-REVIEW.md)) |
 | **Builtin + user script modules** (`request`/`client`/`crypto`/… as JS; user `.script` overrides) | [docs/SCRIPT-EXT.md](docs/SCRIPT-EXT.md) + `lsp/builtin_script/` |
 | **Review / crash-hardening notes** | [docs/REVIEW-SCRIPT-COMPLETIONS.md](docs/REVIEW-SCRIPT-COMPLETIONS.md) |
 | JSON body highlighting | Tree-sitter injections (bodies only; no JS inject in scripts) |
@@ -152,6 +152,7 @@ Optional. Works without it if PATH is correct.
   "httpyac": {
     "command": "/absolute/path/to/httpyac",
     "lsp_command": "/absolute/path/to/httpyac-lsp",
+    "vtsls_command": "/absolute/path/to/vtsls",
     "default_env": "dev"
   },
   "lsp": {
@@ -159,6 +160,10 @@ Optional. Works without it if PATH is correct.
       "binary": {
         "path": "/absolute/path/to/httpyac-lsp",
         "arguments": []
+      },
+      "settings": {
+        "vtslsCommand": "/absolute/path/to/vtsls",
+        "vtslsEnabled": true
       }
     }
   },
@@ -174,17 +179,27 @@ Optional. Works without it if PATH is correct.
 }
 ```
 
+Install vtsls once (script-region full TS):
+
+```bash
+npm install -g @vtsls/language-server
+which vtsls && vtsls --version
+```
+
 | Key | Meaning |
 |-----|---------|
 | `httpyac.command` | Path to httpyac CLI |
 | `httpyac.lsp_command` | Path to httpyac-lsp |
+| `httpyac.vtsls_command` | Path to `vtsls` (`@vtsls/language-server`) for script islands |
 | `httpyac.default_env` | Docs/default name; runtime uses JSON `activeEnv` |
 | `lsp.httpyac-lsp.binary.path` | Binary Zed uses to start the LSP |
-| `languages.HTTP.language_servers` | Must include `httpyac-lsp` so Zed starts the server |
+| `lsp.httpyac-lsp.settings.vtslsCommand` | Same as `httpyac.vtsls_command` (preferred by LSP) |
+| `lsp.httpyac-lsp.settings.vtslsEnabled` | `false` disables child vtsls (catalog-only scripts) |
+| `languages.HTTP.language_servers` | Must include **only** `httpyac-lsp` (do **not** add Zed’s `vtsls` on HTTP) |
 | `languages.HTTP.completions.words` | `fallback` = word list only if LSP has no results (avoids “Hello” hiding **Host**) |
 | `languages.HTTP.completions.words_min_length` | Min chars for word completions (use ≥3) |
 
-Process env: `HTTPYAC_BIN` = absolute path to httpyac.
+Process env: `HTTPYAC_BIN` = httpyac CLI; `HTTPYAC_VTSLS_COMMAND` = vtsls binary (set by extension / install).
 
 > If settings contain `//` comments, the install script **does not auto-write** (preserves comments).
 

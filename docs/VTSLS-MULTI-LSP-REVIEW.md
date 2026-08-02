@@ -213,12 +213,14 @@ Our docs and `injections.scm` encode the failed experiment:
 | **Spike proxy** | Prototype child vtsls + one completion path behind a flag; measure latency and ambient types. |
 | **Wait for Zed islands** | Watch embedded multi-LSP issues; re-enable JS injection only if editor routes by range. |
 
-**Recommendation:** keep shipping **A + B**.
+**Recommendation:**
 
-- Want **完整 Zed vtsls** → open real `.js` (A).  
-- Want tips **inside** `.http` without a second process → catalog (B).  
-- Want partial TS-like completion inside `{{ }}` without leaving HTTP → only then
-  consider **C**, and document it as **capability hand-off**, never as “Zed vtsls”.
+- Want **完整 Zed-managed vtsls** → open real `.js` (A).  
+- Want tips **inside** `.http` without vtsls installed → catalog (B).  
+- Want **full TS completion/hover/definition inside script islands** → **C is implemented**
+  on branch `vtsls`: install `@vtsls/language-server`, set `httpyac.vtsls_command` /
+  `lsp.httpyac-lsp.settings.vtslsCommand` (see `install_to_zed.sh`). Still a **child**
+  process hand-off, not Zed’s language-server row for the HTTP buffer.
 
 ---
 
