@@ -88,41 +88,82 @@ print_manual_json_block() {
   echo "    3. 注意 JSON ${C_YEL}逗号${C_RESET}；${C_GRN}保留${C_RESET} 你原来的其它配置和注释"
   echo ""
   echo "${C_BG_YEL}>>>>>>>>>>  从下一行开始复制  >>>>>>>>>>${C_RESET}"
-  echo "${C_DIM}# ----- COPY START -----${C_RESET}"
+  echo "${C_DIM}# ----- COPY START（Zed settings 支持 // 注释；自动写入时会剥掉注释） -----${C_RESET}"
   cat <<EOF
+  // ── httpyac 扩展相关（路径类：填绝对路径字符串）────────────────
   "httpyac": {
+    // command: httpyac CLI 可执行文件路径 | 或 PATH 里的命令名 "httpyac"
     "command": "$HTTPYAC_PATH",
+    // lsp_command: httpyac-lsp 路径 | 一般 ~/.local/bin/httpyac-lsp
     "lsp_command": "$LSP_PATH",
+    // vtsls_command: child vtsls 路径（仅 script 引擎=vtsls 时用）| "vtsls" | which vtsls
     "vtsls_command": "$VTSLS_PATH",
+    // use_builtin_script_completions: true=内置 catalog | false=只用 child vtsls（与 vtsls 互斥）
+    "use_builtin_script_completions": true,
+    // default_env: 文档/默认名字符串（如 "dev"|"prod"|"test"）；真正发请求以 env JSON 的 activeEnv 为准
     "default_env": "dev"
   },
   "lsp": {
     "httpyac-lsp": {
       "binary": {
+        // path: Zed 启动 LSP 的绝对路径
         "path": "$LSP_PATH",
+        // arguments: 传给 httpyac-lsp 的额外参数数组，通常 []
         "arguments": []
       },
       "settings": {
+        // vtslsCommand: 同 httpyac.vtsls_command（LSP 优先读这里）
         "vtslsCommand": "$VTSLS_PATH",
+        // vtslsEnabled: true=允许拉起 vtsls | false=强制走 builtin（即使 source 写成 vtsls）
         "vtslsEnabled": true,
+        // useBuiltinScriptCompletions: true= {{}} 只用内置 catalog | false=只用 child vtsls（互斥，不能两个一起）
         "useBuiltinScriptCompletions": true,
+        // scriptCompletionSource: "builtin"|"catalog"|"httpyac" = 内置
+        //                         "vtsls"|"ts"|"typescript" = child vtsls
+        // （与 useBuiltinScriptCompletions 二选一写法，效果相同）
         "scriptCompletionSource": "builtin"
       }
     }
   },
   "languages": {
     "HTTP": {
+      // enable_language_server: true | false
       "enable_language_server": true,
+      // language_servers: 只能 ["httpyac-lsp"] — 不要加 "vtsls"（整文件当 TS 会炸）
       "language_servers": ["httpyac-lsp"],
       "completions": {
+        // lsp: true=用 LSP 补全 | false=关闭
         "lsp": true,
+        // words: "disabled"=不要单词补全 | "fallback"=LSP 无结果时再用单词 | "enabled"=总开
+        // （推荐 fallback 或 disabled，避免 Hello 盖住 Host）
         "words": "disabled"
+        // 可选 words_min_length: 数字 ≥1，单词补全最小长度，常用 3
       }
     }
   }
 EOF
   echo "${C_DIM}# ----- COPY END -----${C_RESET}"
   echo "${C_BG_YEL}<<<<<<<<<<  复制到上一行结束  <<<<<<<<<<${C_RESET}"
+  echo ""
+  echo "${C_CYN}${C_BOLD}  【配置项可选值速查】${C_RESET}"
+  echo "    ${C_BOLD}script 补全引擎（{{}} 内互斥，只生效一个）${C_RESET}"
+  echo "      useBuiltinScriptCompletions / use_builtin_script_completions"
+  echo "        → ${C_GRN}true${C_RESET}  = 内置 catalog（@returns / .script / require 形状）  ${C_DIM}【默认】${C_RESET}"
+  echo "        → ${C_YEL}false${C_RESET} = child vtsls（需 npm i -g @vtsls/language-server）"
+  echo "      scriptCompletionSource"
+  echo "        → ${C_GRN}\"builtin\"${C_RESET} | \"catalog\" | \"httpyac\"     = 同上内置"
+  echo "        → ${C_YEL}\"vtsls\"${C_RESET}   | \"ts\" | \"typescript\" = 同上 vtsls"
+  echo "      vtslsEnabled"
+  echo "        → ${C_GRN}true${C_RESET}  = 允许启动 vtsls（当 source=vtsls 时）"
+  echo "        → ${C_YEL}false${C_RESET} = 强制 builtin"
+  echo "    ${C_BOLD}路径类（字符串）${C_RESET}"
+  echo "      httpyac.command / lsp_command / vtsls_command / lsp.httpyac-lsp.binary.path"
+  echo "        → 绝对路径，或 PATH 中的命令名"
+  echo "    ${C_BOLD}HTTP 语言${C_RESET}"
+  echo "      language_servers → 仅 ${C_GRN}[\"httpyac-lsp\"]${C_RESET}（禁止加 vtsls）"
+  echo "      completions.words → ${C_GRN}\"disabled\"${C_RESET} | \"fallback\" | \"enabled\""
+  echo "      completions.lsp   → true | false"
+  echo "      default_env       → 任意环境名字符串（dev/prod/…）"
   echo ""
   echo "${C_MAG}${C_BOLD}  【不想手改？】${C_RESET}可强制自动写入（${C_RED}会丢掉 // 注释${C_RESET}，会先备份）："
   echo "    ${C_BOLD}FORCE_ZED_SETTINGS=1 $0${C_RESET}"
@@ -369,9 +410,10 @@ if [[ -z "$VTSLS_PATH" ]]; then
 fi
 if [[ -z "$VTSLS_PATH" ]]; then
   VTSLS_PATH="vtsls"
-  print_manual_box "安装 vtsls（.http script 区完整 TS 补全需要）" \
+  print_manual_box "安装 vtsls（仅当 script 引擎选 vtsls 时需要）" \
     "原因：当前 PATH 中找不到 vtsls（@vtsls/language-server）" \
-    "说明：httpyac-lsp 会在 {{ }} / script 内启动子进程 vtsls --stdio" \
+    "说明：默认 useBuiltinScriptCompletions=true 用内置 catalog，可不装 vtsls" \
+    "      若要用 child vtsls：useBuiltinScriptCompletions=false 或 scriptCompletionSource=\"vtsls\"" \
     "" \
     "请执行：" \
     "  npm install -g @vtsls/language-server" \
@@ -379,11 +421,13 @@ if [[ -z "$VTSLS_PATH" ]]; then
     "然后验证：" \
     "  which vtsls && vtsls --version" \
     "" \
-    "装好后可写入 settings（或重跑本脚本）：" \
-    "  \"httpyac\": { \"vtsls_command\": \"\$(which vtsls)\" }" \
-    "  \"lsp\": { \"httpyac-lsp\": { \"settings\": { \"vtslsCommand\": \"\$(which vtsls)\", \"useBuiltinScriptCompletions\": true } } }"
-  WARNINGS+=("未找到 vtsls — script 区将回退到 catalog 提示")
-  MANUAL_REQUIRED+=("安装 vtsls：npm install -g @vtsls/language-server（script 完整补全）")
+    "装好后写入 settings（注释=可选值）：" \
+    "  \"vtslsCommand\": \"\$(which vtsls)\"   // 路径字符串" \
+    "  \"useBuiltinScriptCompletions\": false // true=内置 | false=vtsls（互斥）" \
+    "  \"scriptCompletionSource\": \"vtsls\"  // \"builtin\"|\"catalog\"|\"httpyac\" | \"vtsls\"|\"ts\"" \
+    "  \"vtslsEnabled\": true                 // true=允许 vtsls | false=强制 builtin"
+  WARNINGS+=("未找到 vtsls — 保持 useBuiltinScriptCompletions=true 即可用内置 catalog")
+  MANUAL_OPTIONAL+=("可选：npm i -g @vtsls/language-server，再设 useBuiltinScriptCompletions=false 用 vtsls")
 else
   echo "  ✅ vtsls      = $VTSLS_PATH"
   OK_VTSLS=1
