@@ -27,7 +27,11 @@ use tokio::sync::{oneshot, Mutex};
 use tower_lsp::lsp_types::*;
 use tower_lsp::Client;
 
-/// Ambient lines prepended to every virtual TS doc (httpyac script globals).
+/// Ambient lines prepended to every virtual TS doc (httpyac script globals + Node stubs).
+///
+/// Critical: `require('crypto')` must **not** be typed as bare `any`, or `crypto.` after
+/// `const crypto = require('crypto')` yields **no member completions** in vtsls (while bare
+/// `crypt` still suggests global `Crypto` / DOM names — looks like “vtsls half works”).
 pub const AMBIENT_PREAMBLE: &str = r#"/* httpyac-lsp virtual buffer — do not edit */
 /** httpyac request object */
 declare const request: {
@@ -57,7 +61,64 @@ declare const client: {
 declare const console: Console;
 declare const exports: Record<string, unknown>;
 declare function test(name: string, fn: () => void): void;
+
+// ── Node-ish stubs so require('crypto') | require('fs') | … get real `.` members ──
+interface HttpyacHash {
+  update(data: string | Uint8Array, inputEncoding?: string): HttpyacHash;
+  digest(): Buffer;
+  digest(encoding: string): string;
+}
+interface HttpyacHmac {
+  update(data: string | Uint8Array, inputEncoding?: string): HttpyacHmac;
+  digest(): Buffer;
+  digest(encoding: string): string;
+}
+interface HttpyacNodeCrypto {
+  createHmac(algorithm: string, key: string | Uint8Array): HttpyacHmac;
+  createHash(algorithm: string): HttpyacHash;
+  createSign(algorithm: string): { update(data: string | Uint8Array): any; sign(key: string, enc?: string): string | Buffer };
+  createVerify(algorithm: string): { update(data: string | Uint8Array): any; verify(key: string, sig: string, enc?: string): boolean };
+  randomBytes(size: number): Buffer;
+  randomUUID(): string;
+  pbkdf2Sync(password: string, salt: string, iterations: number, keylen: number, digest: string): Buffer;
+  scryptSync(password: string, salt: string, keylen: number): Buffer;
+  [key: string]: unknown;
+}
+interface HttpyacNodeFs {
+  readFileSync(path: string, encoding?: string): string | Buffer;
+  writeFileSync(path: string, data: string | Uint8Array, encoding?: string): void;
+  existsSync(path: string): boolean;
+  readdirSync(path: string): string[];
+  statSync(path: string): { isFile(): boolean; isDirectory(): boolean; size: number };
+  [key: string]: unknown;
+}
+interface HttpyacNodePath {
+  join(...parts: string[]): string;
+  resolve(...parts: string[]): string;
+  dirname(p: string): string;
+  basename(p: string, ext?: string): string;
+  extname(p: string): string;
+  normalize(p: string): string;
+  [key: string]: unknown;
+}
+interface HttpyacNodeBuffer {
+  from(data: string | ArrayBuffer | ArrayLike<number>, encoding?: string): Buffer;
+  alloc(size: number, fill?: string | number, encoding?: string): Buffer;
+  concat(list: Buffer[], totalLength?: number): Buffer;
+  isBuffer(obj: unknown): obj is Buffer;
+  [key: string]: unknown;
+}
+/** Overloads: known Node modules get shapes; other ids stay any. */
+declare function require(id: 'crypto'): HttpyacNodeCrypto;
+declare function require(id: 'node:crypto'): HttpyacNodeCrypto;
+declare function require(id: 'fs'): HttpyacNodeFs;
+declare function require(id: 'node:fs'): HttpyacNodeFs;
+declare function require(id: 'path'): HttpyacNodePath;
+declare function require(id: 'node:path'): HttpyacNodePath;
+declare function require(id: 'buffer'): { Buffer: HttpyacNodeBuffer };
+declare function require(id: 'node:buffer'): { Buffer: HttpyacNodeBuffer };
 declare function require(id: string): any;
+
 export {};
 "#;
 
@@ -1185,4 +1246,77 @@ mod live_vtsls {
             "expected signed in {labels:?}"
         );
     }
+
+    #[tokio::test]
+    async fn live_crypto_member_after_dot() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+        let http = r#"###
+{{
+  const crypto = require('crypto');
+  crypto.
+}}
+"#;
+        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        proxy.sync_document(&uri, http).await.expect("sync");
+        // 0=### 1={{ 2=const 3=crypto.
+        let pos = Position {
+            line: 3,
+            character: 9,
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        let res = proxy.completion(&uri, pos, None).await.expect("ok");
+        let labels: Vec<String> = match res {
+            Some(CompletionResponse::Array(items)) => {
+                items.into_iter().map(|i| i.label).collect()
+            }
+            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|i| i.label).collect(),
+            None => vec![],
+        };
+        eprintln!(
+            "n={} first40={:?}",
+            labels.len(),
+            &labels[..labels.len().min(40)]
+        );
+        assert!(
+            labels.iter().any(|l| {
+                l.contains("createHmac") || l.contains("createHash") || l.contains("randomBytes")
+            }),
+            "expected Node crypto members, got {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_hmac_chain_after_createhmac() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone())).await.expect("spawn");
+        let http = r#"###
+{{
+  const crypto = require('crypto');
+  const h = crypto.createHmac('sha256', 'secret');
+  h.
+}}
+"#;
+        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        proxy.sync_document(&uri, http).await.unwrap();
+        let pos = Position { line: 4, character: 4 }; // "  h."
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let res = proxy.completion(&uri, pos, None).await.unwrap();
+        let labels: Vec<_> = match res {
+            Some(CompletionResponse::Array(i)) => i.into_iter().map(|x| x.label).collect(),
+            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|x| x.label).collect(),
+            None => vec![],
+        };
+        eprintln!("hmac members={labels:?}");
+        assert!(labels.iter().any(|l| l.contains("update") || l.contains("digest")), "{labels:?}");
+    }
+
 }
+
