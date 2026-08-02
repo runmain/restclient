@@ -723,85 +723,6 @@ impl HttpLsp {
             return Ok(None);
         }
 
-        // Script-region: try child vtsls first (async; full TS IntelliSense).
-        {
-            let lines: Vec<&str> = content.split('\n').collect();
-            let line_idx = position.line as usize;
-            if line_idx < lines.len() {
-                let current_line = lines[line_idx];
-                let col = lsp_utf16_to_byte(current_line, position.character);
-                let before_cursor = &current_line[..col.min(current_line.len())];
-                if in_script_context(&lines, line_idx, before_cursor) {
-                    self.ensure_vtsls(&uri).await;
-                    self.vtsls.sync(&uri, &content).await;
-                    let vtsls_items = {
-                        let proxy = self.vtsls.proxy.lock().await;
-                        if let Some(p) = proxy.as_ref() {
-                            match p
-                                .completion(&uri, position, params.context.clone())
-                                .await
-                            {
-                                Ok(Some(CompletionResponse::Array(items))) if !items.is_empty() => {
-                                    Some(items)
-                                }
-                                Ok(Some(CompletionResponse::List(list)))
-                                    if !list.items.is_empty() =>
-                                {
-                                    Some(list.items)
-                                }
-                                Ok(_) => None,
-                                Err(e) => {
-                                    self.client
-                                        .log_message(
-                                            MessageType::WARNING,
-                                            format!("vtsls completion: {e}"),
-                                        )
-                                        .await;
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(mut items) = vtsls_items {
-                        let labels: std::collections::HashSet<_> =
-                            items.iter().map(|i| i.label.clone()).collect();
-                        let partial = before_cursor
-                            .rsplit(|c: char| {
-                                !c.is_ascii_alphanumeric() && c != '_' && c != '$'
-                            })
-                            .next()
-                            .unwrap_or("")
-                            .trim();
-                        if !before_cursor.contains('.') {
-                            for (root, desc) in SCRIPT_ROOTS {
-                                if labels.contains(*root) {
-                                    continue;
-                                }
-                                if !partial.is_empty() && !root.starts_with(partial) {
-                                    continue;
-                                }
-                                items.push(CompletionItem {
-                                    label: (*root).to_string(),
-                                    kind: Some(CompletionItemKind::VARIABLE),
-                                    detail: Some(format!("httpyac global — {desc}")),
-                                    insert_text: Some((*root).to_string()),
-                                    sort_text: Some(format!("1{root}")),
-                                    commit_characters: Some(vec![".".into()]),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                        return Ok(Some(CompletionResponse::List(CompletionList {
-                            is_incomplete: true,
-                            items,
-                        })));
-                    }
-                }
-            }
-        }
-
         let catalog = self.catalog_for_uri(&uri).await;
         let env_vars = Self::load_env_vars_for_completion(&uri);
         let http_dir = uri
@@ -810,14 +731,130 @@ impl HttpLsp {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Always run catalog (httpyac shapes / Host / vars / …). Panic-isolated.
+        let catalog_resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             completion_sync(&content, position, &catalog, &env_vars, &http_dir)
-        }));
-        match result {
-            Ok(r) => Ok(r),
-            Err(_) => Ok(None),
+        })) {
+            Ok(r) => r,
+            Err(_) => None,
+        };
+
+        // Script region: also query child vtsls, then **merge** (do not replace).
+        // Previously vtsls-only early-return hid catalog tips → "sometimes yes, sometimes no".
+        let lines: Vec<&str> = content.split('\n').collect();
+        let line_idx = position.line as usize;
+        let in_script = if line_idx < lines.len() {
+            let current_line = lines[line_idx];
+            let col = lsp_utf16_to_byte(current_line, position.character);
+            let before_cursor = &current_line[..col.min(current_line.len())];
+            in_script_context(&lines, line_idx, before_cursor)
+        } else {
+            false
+        };
+
+        if !in_script {
+            return Ok(catalog_resp);
         }
+
+        self.ensure_vtsls(&uri).await;
+        self.vtsls.sync(&uri, &content).await;
+        let vtsls_items = {
+            let proxy = self.vtsls.proxy.lock().await;
+            if let Some(p) = proxy.as_ref() {
+                match p
+                    .completion(&uri, position, params.context.clone())
+                    .await
+                {
+                    Ok(Some(CompletionResponse::Array(items))) => items,
+                    Ok(Some(CompletionResponse::List(list))) => list.items,
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        self.client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("vtsls completion: {e}"),
+                            )
+                            .await;
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
+        let merged = merge_script_completions(catalog_resp, vtsls_items);
+        Ok(merged)
     }
+}
+
+/// Merge httpyac **catalog** + child **vtsls** items for script islands.
+/// - Catalog first (sort `0…`) — reliable `@returns` / require shapes
+/// - vtsls fills gaps (sort `1…`) — Node/TS surface catalog does not know
+/// - Same label: keep catalog (already tagged `[httpyac]`) unless only vtsls has it
+fn merge_script_completions(
+    catalog: Option<CompletionResponse>,
+    vtsls_items: Vec<CompletionItem>,
+) -> Option<CompletionResponse> {
+    let mut out: Vec<CompletionItem> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    fn push_unique(
+        out: &mut Vec<CompletionItem>,
+        seen: &mut std::collections::HashSet<String>,
+        item: CompletionItem,
+        sort_prefix: &str,
+    ) {
+        let key = completion_merge_key(&item);
+        if key.is_empty() || !seen.insert(key) {
+            return;
+        }
+        let mut item = item;
+        let label = item.label.clone();
+        item.sort_text = Some(format!(
+            "{sort_prefix}{}",
+            item.sort_text.unwrap_or(label)
+        ));
+        out.push(item);
+    }
+
+    match catalog {
+        Some(CompletionResponse::Array(items)) => {
+            for it in items {
+                push_unique(&mut out, &mut seen, it, "0");
+            }
+        }
+        Some(CompletionResponse::List(list)) => {
+            for it in list.items {
+                push_unique(&mut out, &mut seen, it, "0");
+            }
+        }
+        None => {}
+    }
+
+    // Cap extreme vtsls dumps (DOM globals) when catalog already has useful hits,
+    // but still allow a generous set for crypto./Buffer. etc.
+    let vtsls_cap = if out.is_empty() { 80 } else { 40 };
+    for it in vtsls_items.into_iter().take(vtsls_cap) {
+        push_unique(&mut out, &mut seen, it, "1");
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items: out,
+        }))
+    }
+}
+
+fn completion_merge_key(item: &CompletionItem) -> String {
+    // Prefer bare member name: "signed.authDate" → "authdate", "authDate" → "authdate"
+    let label = item.label.trim();
+    let base = label.rsplit('.').next().unwrap_or(label);
+    let base = base.trim_end_matches('(').trim_end_matches(')');
+    base.to_ascii_lowercase()
 }
 
 /// Sync completion body (panic-catchable). Kept free of `.await`.
