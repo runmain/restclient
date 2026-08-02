@@ -8,9 +8,9 @@ use httpyac_lsp::completions::{
 };
 use httpyac_lsp::parser::{parse_http_file, HttpRequest};
 use httpyac_lsp::script_ext::{
-    enrich_catalog_from_requires, ingest_script_locals, parse_typed_bindings,
-    resolve_completion_path, resolve_path_with_bindings, script_window_text, PathResolve,
-    ScriptCatalog, ScriptCatalogCache, ScriptMember,
+    enrich_catalog_from_requires, ensure_shape_type, infer_expr_type, ingest_script_locals,
+    parse_typed_bindings, resolve_completion_path, resolve_path_with_bindings, script_window_text,
+    PathResolve, ScriptCatalog, ScriptCatalogCache, ScriptMember,
 };
 use httpyac_lsp::variables::VariableResolver;
 use httpyac_lsp::vtsls_proxy::{ScriptCompletionSource, VtslsBridge};
@@ -760,7 +760,20 @@ impl HttpLsp {
             completion_sync(&content, position, &catalog, &env_vars, &http_dir)
         })) {
             Ok(r) => r,
-            Err(_) => None,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic".into());
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("httpyac-lsp completion panic (catalog): {msg}"),
+                    )
+                    .await;
+                None
+            }
         };
 
         let lines: Vec<&str> = content.split('\n').collect();
@@ -1223,53 +1236,73 @@ fn completion_sync(
             }
 
             // Resolve path.filter from dotted_prefix OR suffix fallback (request. / response. …)
-            let dotted = dotted_prefix(before_cursor).or_else(|| {
-                let t = before_cursor.trim_end();
-                for (suf, path) in [
-                    ("client.global.", "client.global"),
-                    ("response.headers.", "response.headers"),
-                    ("request.headers.", "request.headers"),
-                    ("response.", "response"),
-                    ("request.", "request"),
-                    ("client.", "client"),
-                    ("console.", "console"),
-                    ("crypto.", "crypto"),
-                    ("Buffer.", "Buffer"),
-                    ("JSON.", "JSON"),
-                    ("Math.", "Math"),
-                    ("Object.", "Object"),
-                    ("Array.", "Array"),
-                    ("Date.", "Date"),
-                    ("fs.", "fs"),
-                    ("path.", "path"),
-                ] {
-                    if t.ends_with(suf) {
-                        return Some((path.to_string(), String::new()));
+            // Bare id: `signRe` → ("", "signRe") so require bindings / locals always run.
+            let dotted = dotted_prefix(before_cursor)
+                .or_else(|| {
+                    let t = before_cursor.trim_end();
+                    for (suf, path) in [
+                        ("client.global.", "client.global"),
+                        ("response.headers.", "response.headers"),
+                        ("request.headers.", "request.headers"),
+                        ("response.", "response"),
+                        ("request.", "request"),
+                        ("client.", "client"),
+                        ("console.", "console"),
+                        ("crypto.", "crypto"),
+                        ("Buffer.", "Buffer"),
+                        ("JSON.", "JSON"),
+                        ("Math.", "Math"),
+                        ("Object.", "Object"),
+                        ("Array.", "Array"),
+                        ("Date.", "Date"),
+                        ("fs.", "fs"),
+                        ("path.", "path"),
+                    ] {
+                        if t.ends_with(suf) {
+                            return Some((path.to_string(), String::new()));
+                        }
                     }
-                }
-                // require-alias: `c.` / `myCrypto.` when const c = require('crypto')
-                for b in &require_bindings {
-                    let suf = format!("{}.", b.name);
-                    if t.ends_with(&suf) {
-                        return Some((b.name.clone(), String::new()));
+                    for b in &require_bindings {
+                        let suf = format!("{}.", b.name);
+                        if t.ends_with(&suf) {
+                            return Some((b.name.clone(), String::new()));
+                        }
                     }
-                }
-                // typed locals: `h.` when const h = crypto.createHmac(...)
-                for vname in var_types.keys() {
-                    let suf = format!("{vname}.");
-                    if t.ends_with(&suf) {
-                        return Some((vname.clone(), String::new()));
+                    for vname in var_types.keys() {
+                        let suf = format!("{vname}.");
+                        if t.ends_with(&suf) {
+                            return Some((vname.clone(), String::new()));
+                        }
                     }
-                }
-                // Module stems from catalog (builtin + user): `helpers.` `crypto.` …
-                for (stem, _) in script_catalog.module_roots() {
-                    let suf = format!("{stem}.");
-                    if t.ends_with(&suf) {
-                        return Some((stem, String::new()));
+                    for (stem, _) in script_catalog.module_roots() {
+                        let suf = format!("{stem}.");
+                        if t.ends_with(&suf) {
+                            return Some((stem, String::new()));
+                        }
                     }
-                }
-                None
-            });
+                    None
+                })
+                // Last resort bare word (Zed sometimes queries with odd whitespace)
+                .or_else(|| {
+                    let t = before_cursor.trim_end();
+                    if t.ends_with('.') {
+                        return None;
+                    }
+                    let filter: String = t
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    if filter.is_empty() {
+                        // empty line in script — still offer locals with empty filter
+                        Some((String::new(), String::new()))
+                    } else {
+                        Some((String::new(), filter))
+                    }
+                });
 
             if let Some((path_raw, filter)) = dotted {
                 // const c = require('crypto') → c.xxx uses crypto table
@@ -1277,8 +1310,15 @@ fn completion_sync(
                 // Display path keeps what the user typed (c.createHmac) for Zed filter_text
                 let display_path = path_raw.clone();
                 let filter_l = filter.to_lowercase();
+                // Replace range for bare-ident filter (`sign` → `signRequest`) or member filter
                 let member_start =
                     member_col(before_cursor, filter.len());
+                // Byte span of the partial word for text_edit when path is empty
+                let bare_replace_start = if path_raw.is_empty() && !filter.is_empty() {
+                    member_col(before_cursor, filter.len())
+                } else {
+                    member_start
+                };
 
                 // Snippet insert text for well-known method names (editor UX only).
                 let enrich_insert = |name: &str, default: String, is_method: bool| -> (String, bool) {
@@ -1432,32 +1472,42 @@ fn completion_sync(
                         }
                     }
                     // require() binding names (whole module + destructured exports)
+                    // e.g. typing `signRe` → `signRequest` from
+                    //   const { signRequest } = require('./scripts/auth-sign.js')
                     for b in &require_bindings {
                         if filter_l.is_empty() || b.name.to_lowercase().starts_with(&filter_l) {
                             let (detail, commit, docs) = if b.maps_to_module {
                                 (
                                     format!(
-                                        "require('{}') → module `{}`",
-                                        b.raw_path.as_deref().unwrap_or(&b.module),
+                                        "[httpyac] require → module `{}`",
                                         b.module
                                     ),
                                     Some(vec![".".to_string()]),
                                     format!(
-                                        "Whole-module binding — type `{}.` for exports from `{}`",
-                                        b.name, b.module
+                                        "Whole-module binding from require('{}') — type `{}.`",
+                                        b.raw_path.as_deref().unwrap_or(&b.module),
+                                        b.name
                                     ),
                                 )
                             } else {
                                 (
-                                    format!("destructured from `{}`", b.module),
-                                    None,
                                     format!(
-                                        "Export `{}` from require('{}')",
+                                        "[httpyac] require export from `{}`",
+                                        b.module
+                                    ),
+                                    Some(vec!["(".to_string(), ".".to_string()]),
+                                    format!(
+                                        "Destructured `{}` from require('{}').\n\
+                                         Type `{}(` to call; after `)` use `.` for @returns members.",
                                         b.name,
-                                        b.raw_path.as_deref().unwrap_or(&b.module)
+                                        b.raw_path.as_deref().unwrap_or(&b.module),
+                                        b.name
                                     ),
                                 )
                             };
+                            // Plain name (not snippet) so Zed filter always keeps the item;
+                            // commitChars offer `(` for the next step.
+                            let insert = b.name.clone();
                             items.push(CompletionItem {
                                 label: b.name.clone(),
                                 kind: Some(if b.maps_to_module {
@@ -1466,11 +1516,96 @@ fn completion_sync(
                                     CompletionItemKind::FUNCTION
                                 }),
                                 detail: Some(detail),
-                                insert_text: Some(b.name.clone()),
-                                filter_text: Some(b.name.clone()),
-                                sort_text: Some(format!("0{}", b.name)),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: line_num,
+                                            character: bare_replace_start,
+                                        },
+                                        end: Position {
+                                            line: line_num,
+                                            character: position.character,
+                                        },
+                                    },
+                                    new_text: insert.clone(),
+                                })),
+                                insert_text: Some(insert),
+                                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                                // Zed client-filters on query vs filter_text/label — keep
+                                // both the full name and a form that starts with the query.
+                                filter_text: Some(if filter_l.is_empty() {
+                                    b.name.clone()
+                                } else {
+                                    format!("{} {}", b.name, filter)
+                                }),
+                                sort_text: Some(format!("00{}", b.name)),
+                                preselect: Some(
+                                    !filter_l.is_empty()
+                                        && b.name.to_lowercase().starts_with(&filter_l),
+                                ),
                                 commit_characters: commit,
                                 documentation: Some(Documentation::String(docs)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    // Also offer **exports of required modules** as bare names
+                    // (covers parse edge cases / whole-module require).
+                    let mut seen_export = std::collections::HashSet::new();
+                    for b in &require_bindings {
+                        seen_export.insert(b.name.clone());
+                    }
+                    for b in &require_bindings {
+                        let exports = script_catalog.members_for_path(&b.module);
+                        for m in exports {
+                            if !seen_export.insert(m.name.clone()) {
+                                continue;
+                            }
+                            if !filter_l.is_empty()
+                                && !m.name.to_lowercase().starts_with(&filter_l)
+                            {
+                                continue;
+                            }
+                            let insert = m.name.clone();
+                            items.push(CompletionItem {
+                                label: m.name.clone(),
+                                kind: Some(if m.is_method {
+                                    CompletionItemKind::FUNCTION
+                                } else {
+                                    CompletionItemKind::VARIABLE
+                                }),
+                                detail: Some(format!(
+                                    "[httpyac] export of `{}`",
+                                    b.module
+                                )),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: line_num,
+                                            character: bare_replace_start,
+                                        },
+                                        end: Position {
+                                            line: line_num,
+                                            character: position.character,
+                                        },
+                                    },
+                                    new_text: insert.clone(),
+                                })),
+                                insert_text: Some(insert),
+                                filter_text: Some(if filter_l.is_empty() {
+                                    m.name.clone()
+                                } else {
+                                    format!("{} {}", m.name, filter)
+                                }),
+                                sort_text: Some(format!("01{}", m.name)),
+                                commit_characters: Some(vec![
+                                    "(".to_string(),
+                                    ".".to_string(),
+                                ]),
+                                documentation: Some(Documentation::String(format!(
+                                    "[httpyac catalog] `{}` from require module `{}`",
+                                    m.name, b.module
+                                ))),
                                 ..Default::default()
                             });
                         }
@@ -1481,13 +1616,26 @@ fn completion_sync(
                             items.push(CompletionItem {
                                 label: vname.clone(),
                                 kind: Some(CompletionItemKind::VARIABLE),
-                                detail: Some(format!(": {ty} (inferred)")),
+                                detail: Some(format!("[httpyac] : {ty} (inferred)")),
+                                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                    range: Range {
+                                        start: Position {
+                                            line: line_num,
+                                            character: bare_replace_start,
+                                        },
+                                        end: Position {
+                                            line: line_num,
+                                            character: position.character,
+                                        },
+                                    },
+                                    new_text: vname.clone(),
+                                })),
                                 insert_text: Some(vname.clone()),
                                 filter_text: Some(vname.clone()),
                                 sort_text: Some(format!("0{vname}")),
                                 commit_characters: Some(vec![".".to_string()]),
                                 documentation: Some(Documentation::String(format!(
-                                    "Inferred type `{ty}` from assignment — type `{vname}.` for members"
+                                    "[httpyac catalog] Inferred type `{ty}` — type `{vname}.` for members"
                                 ))),
                                 ..Default::default()
                             });
@@ -1510,43 +1658,68 @@ fn completion_sync(
                         }
                     }
                 } else {
-                    // Member path: modules / path_ext / **inferred var types** (Hmac chain, …)
-                    let resolved = resolve_completion_path(
-                        &path,
-                        &script_catalog,
-                        &require_bindings,
-                        &var_types,
-                    );
-                    let mut script_members = match &resolved {
-                        PathResolve::Type { type_name, rest } => {
-                            script_catalog.members_for_type(type_name, rest)
+                    // Member path: modules / vars / **call-result chains** `fn(…).`
+                    let mut script_members: Vec<ScriptMember> = Vec::new();
+
+                    // `signRequest(request, 'secret').` → infer return shape, not module path
+                    if path.contains('(') {
+                        if let Some(ty) = infer_expr_type(
+                            &path,
+                            &script_catalog,
+                            &require_bindings,
+                            &var_types,
+                        ) {
+                            let ty = ensure_shape_type(&mut script_catalog, &ty, "call");
+                            script_members = script_catalog.members_for_type(&ty, "");
                         }
-                        PathResolve::ModulePath(p) => script_catalog.members_for_path(p),
-                    };
-                    if display_path != path {
-                        let disp = resolve_completion_path(
-                            &display_path,
+                    }
+
+                    if script_members.is_empty() {
+                        let resolved = resolve_completion_path(
+                            &path,
                             &script_catalog,
                             &require_bindings,
                             &var_types,
                         );
-                        let extra = match disp {
+                        script_members = match &resolved {
                             PathResolve::Type { type_name, rest } => {
-                                script_catalog.members_for_type(&type_name, &rest)
+                                script_catalog.members_for_type(type_name, rest)
                             }
-                            PathResolve::ModulePath(dp) => script_catalog.members_for_path(&dp),
+                            PathResolve::ModulePath(p) => script_catalog.members_for_path(p),
                         };
-                        for em in extra {
-                            if let Some(pos) =
-                                script_members.iter().position(|x| x.name == em.name)
-                            {
-                                script_members[pos] = em;
-                            } else {
-                                script_members.push(em);
+                        if display_path != path {
+                            let disp = resolve_completion_path(
+                                &display_path,
+                                &script_catalog,
+                                &require_bindings,
+                                &var_types,
+                            );
+                            let extra = match disp {
+                                PathResolve::Type { type_name, rest } => {
+                                    script_catalog.members_for_type(&type_name, &rest)
+                                }
+                                PathResolve::ModulePath(dp) => {
+                                    script_catalog.members_for_path(&dp)
+                                }
+                            };
+                            for em in extra {
+                                if let Some(pos) =
+                                    script_members.iter().position(|x| x.name == em.name)
+                                {
+                                    script_members[pos] = em;
+                                } else {
+                                    script_members.push(em);
+                                }
                             }
                         }
                     }
-                    push_script_members(&mut items, &display_path, &script_members, "0");
+                    // Display label: use short receiver for call exprs
+                    let display = if path.contains('(') {
+                        path.split('(').next().unwrap_or(path.as_str())
+                    } else {
+                        display_path.as_str()
+                    };
+                    push_script_members(&mut items, display, &script_members, "0");
                 }
 
                 if !items.is_empty() {

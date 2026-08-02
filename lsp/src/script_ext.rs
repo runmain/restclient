@@ -2605,15 +2605,56 @@ fn is_reserved(name: &str) -> bool {
     )
 }
 
-/// Script text near the cursor (current request region) for require-binding scan.
+/// Script text for require/type inference around the cursor.
+///
+/// Prefers the full `{{ … }}` island (including lines **below** the cursor) so
+/// `const signed = signRequest(…)` still types `signed` when completing on an
+/// earlier line, and chained tips see the whole pre-request block.
 pub fn script_window_text(lines: &[&str], line_idx: usize) -> String {
     let block_start = (0..=line_idx)
         .rev()
         .find(|&i| lines[i].trim_start().starts_with("###"))
         .map(|i| i + 1)
         .unwrap_or(0);
-    let end = (line_idx + 1).min(lines.len());
-    lines[block_start..end].join("\n")
+    let block_end = ((line_idx + 1)..lines.len())
+        .find(|&i| lines[i].trim_start().starts_with("###"))
+        .unwrap_or(lines.len());
+
+    // Narrow to enclosing {{ … }} when present
+    let mut start = block_start;
+    let mut end = block_end;
+    if let Some(open) = (block_start..=line_idx.min(lines.len().saturating_sub(1)))
+        .rev()
+        .find(|&i| {
+            let t = lines[i].trim();
+            t == "{{" || t.starts_with("{{")
+        })
+    {
+        start = open;
+        if let Some(close) = ((line_idx + 1)..block_end).find(|&i| {
+            let t = lines[i].trim();
+            t == "}}" || t.ends_with("}}")
+        }) {
+            end = close + 1;
+        }
+    }
+
+    // Also include `> {% … %}` handler window
+    if let Some(open) = (block_start..=line_idx.min(lines.len().saturating_sub(1)))
+        .rev()
+        .find(|&i| lines[i].contains("{%"))
+    {
+        start = start.min(open);
+        if let Some(close) = (line_idx..block_end).find(|&i| lines[i].contains("%}")) {
+            end = end.max(close + 1);
+        }
+    }
+
+    if start >= end {
+        let end = (line_idx + 1).min(lines.len());
+        return lines[block_start..end].join("\n");
+    }
+    lines[start..end].join("\n")
 }
 
 /// Builtin module id → static props table name mapping used by main.
@@ -3629,6 +3670,52 @@ mod tests {
         assert!(names.contains(&"authentication"), "got {names:?}");
     }
 
+
+    /// Typing `signRe` after `const { signRequest } = require(...)` must offer signRequest.
+    #[test]
+    fn bare_ident_offers_destructured_require() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let examples = manifest.join("../examples");
+        let http_dir = examples.canonicalize().unwrap_or(examples);
+        let mut cat = load_builtin_catalog();
+        // Same shape as script-vtsls.http island (cursor on "signRe")
+        let text = r#"
+{{
+  const { signRequest } = require('./scripts/auth-sign.js');
+  const signed = signRequest(request, 'secret');
+  exports.authDate = signed.authDate;
+  signRe
+}}
+"#;
+        let binds = enrich_catalog_from_requires(&mut cat, &http_dir, text);
+        assert!(
+            binds.iter().any(|b| b.name == "signRequest"),
+            "require destructure not parsed: {binds:?}"
+        );
+        assert!(
+            cat.modules.contains_key("auth-sign"),
+            "auth-sign.js not loaded from require — path resolve failed under {http_dir:?}"
+        );
+        // Simulate bare filter
+        let filter = "signre";
+        let hits: Vec<_> = binds
+            .iter()
+            .filter(|b| b.name.to_lowercase().starts_with(filter))
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            hits.contains(&"signRequest"),
+            "filter signRe should hit signRequest, got {hits:?} from {binds:?}"
+        );
+        // signed. members
+        let vars = parse_typed_bindings(text, &mut cat, &binds);
+        assert!(vars.contains_key("signed"), "signed not typed: {vars:?}");
+        let ty = vars.get("signed").unwrap();
+        let mem = cat.members_for_type(ty, "");
+        let names: Vec<_> = mem.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"authDate"), "signed. missing authDate: {names:?} ty={ty}");
+    }
+
     #[test]
     fn enrich_loads_relative_require_js() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -3968,3 +4055,23 @@ mod builtin_and_override_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+
+    #[test]
+    fn script_window_includes_require_when_cursor_on_later_line() {
+        let src = r#"###
+{{
+  const { signRequest } = require('./scripts/auth-sign.js');
+  const signed = signRequest(request, 'secret');
+  signRe
+}}
+POST https://x
+"#;
+        let lines: Vec<&str> = src.lines().collect();
+        // line index of signRe
+        let idx = lines.iter().position(|l| l.contains("signRe")).unwrap();
+        let window = script_window_text(&lines, idx);
+        eprintln!("window=\n{window}");
+        assert!(window.contains("require('./scripts/auth-sign.js')"), "window missing require: {window}");
+        assert!(window.contains("signRequest"), "window missing signRequest binding line");
+    }

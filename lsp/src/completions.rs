@@ -781,33 +781,152 @@ mod utf16_pos_tests {
     }
 }
 
-/// Dot-path prefix before cursor for property completion (e.g. "response.st" → ("response", "st")).
+/// Dot-path / call-receiver prefix before cursor for property completion.
+///
+/// - `"response.st"` → `("response", "st")`
+/// - `"signed."` → `("signed", "")`
+/// - `"signRequest(request, 'secret')."` → `("signRequest(request, 'secret')", "")`
+///   (call result members — chain after `)`)
+/// - bare `"sign"` → `("", "sign")`
 pub fn dotted_prefix(before_cursor: &str) -> Option<(String, String)> {
-    // Take trailing identifier path: foo.bar.baz or foo.bar.
     let bytes = before_cursor.as_bytes();
     let mut end = bytes.len();
-    // skip trailing incomplete ident
-    while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_') {
+    // skip trailing incomplete ident (filter)
+    while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_' || bytes[end - 1] == b'$')
+    {
         end -= 1;
     }
     let filter = before_cursor[end..].to_string();
     let rest = before_cursor[..end].trim_end();
     if !rest.ends_with('.') {
-        // bare word at start of script expression
         if filter.is_empty() {
             return None;
         }
-        // could be typing "resp" for response
         return Some((String::new(), filter));
     }
     let without_dot = &rest[..rest.len() - 1];
-    let start = without_dot
-        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let path = without_dot[start..].to_string();
+    let path = take_trailing_receiver_expr(without_dot).unwrap_or_default();
     if path.is_empty() && filter.is_empty() {
         return None;
     }
     Some((path, filter))
+}
+
+/// Walk backward from `s` to capture a JS receiver: `ident`, `a.b`, `foo(…)`, `a.b(…).c(…)`.
+fn take_trailing_receiver_expr(s: &str) -> Option<String> {
+    let s = s.trim_end();
+    if s.is_empty() {
+        return None;
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = chars.len(); // exclusive end index into `chars`
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+
+    while i > 0 {
+        i -= 1;
+        let (_, c) = chars[i];
+
+        if let Some(q) = in_str {
+            if c == q {
+                // count backslashes
+                let mut bs = 0;
+                let mut j = i;
+                while j > 0 && chars[j - 1].1 == '\\' {
+                    bs += 1;
+                    j -= 1;
+                }
+                if bs % 2 == 0 {
+                    in_str = None;
+                }
+            }
+            continue;
+        }
+
+        match c {
+            '\'' | '"' | '`' => in_str = Some(c),
+            ')' | ']' => depth += 1,
+            '(' | '[' => {
+                depth -= 1;
+                if depth < 0 {
+                    // Unmatched open — receiver starts after it
+                    i += 1;
+                    break;
+                }
+            }
+            // Stoppers at top level (not inside call args)
+            c if depth == 0
+                && (c == ';'
+                    || c == ','
+                    || c == '='
+                    || c == '{'
+                    || c == '}'
+                    || c == ':'
+                    || c == '?'
+                    || c == '!'
+                    || c == '&'
+                    || c == '|'
+                    || c == '+'
+                    || c == '-'
+                    || c == '*'
+                    || c == '/'
+                    || c == '%'
+                    || c == '<'
+                    || c == '>'
+                    || c.is_whitespace()) =>
+            {
+                i += 1; // exclude stopper
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if i >= chars.len() {
+        return None;
+    }
+    let start_byte = chars[i].0;
+    let expr = s[start_byte..].trim();
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr.to_string())
+    }
+}
+
+#[cfg(test)]
+mod dotted_prefix_tests {
+    use super::dotted_prefix;
+
+    #[test]
+    fn bare_and_simple_member() {
+        assert_eq!(
+            dotted_prefix("  sign"),
+            Some(("".into(), "sign".into()))
+        );
+        assert_eq!(
+            dotted_prefix("signed."),
+            Some(("signed".into(), "".into()))
+        );
+        assert_eq!(
+            dotted_prefix("signed.au"),
+            Some(("signed".into(), "au".into()))
+        );
+    }
+
+    #[test]
+    fn call_result_member_chain() {
+        assert_eq!(
+            dotted_prefix("signRequest(request, 'secret')."),
+            Some(("signRequest(request, 'secret')".into(), "".into()))
+        );
+        assert_eq!(
+            dotted_prefix("signRequest(request, 'secret').auth"),
+            Some(("signRequest(request, 'secret')".into(), "auth".into()))
+        );
+        assert_eq!(
+            dotted_prefix("crypto.createHmac('sha256', k)."),
+            Some(("crypto.createHmac('sha256', k)".into(), "".into()))
+        );
+    }
 }
