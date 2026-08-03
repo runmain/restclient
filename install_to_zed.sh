@@ -117,11 +117,12 @@ print_manual_json_block() {
         // vtslsEnabled: true=允许拉起 vtsls | false=强制走 builtin（即使 source 写成 vtsls）
         "vtslsEnabled": true,
         // useBuiltinScriptCompletions: true= {{}} 只用内置 catalog | false=只用 child vtsls（互斥，不能两个一起）
-        "useBuiltinScriptCompletions": true,
+        // 有 vtsls 时默认 false=纯 vtsls（shadow+jsconfig+@types/node）；无 vtsls 时 true
+        "useBuiltinScriptCompletions": false,
         // scriptCompletionSource: "builtin"|"catalog"|"httpyac" = 内置
         //                         "vtsls"|"ts"|"typescript" = child vtsls
         // （与 useBuiltinScriptCompletions 二选一写法，效果相同）
-        "scriptCompletionSource": "builtin"
+        "scriptCompletionSource": "vtsls"
       }
     }
   },
@@ -541,9 +542,10 @@ setp(["lsp", "httpyac-lsp", "binary", "path"], lsp, force_update=True)
 setp(["lsp", "httpyac-lsp", "binary", "arguments"], [], force_update=False)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsCommand"], vtsls, force_update=True)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsEnabled"], True, force_update=False)
-# Script tips: builtin XOR vtsls (default builtin — stable httpyac shapes)
-setp(["lsp", "httpyac-lsp", "settings", "useBuiltinScriptCompletions"], True, force_update=False)
-setp(["lsp", "httpyac-lsp", "settings", "scriptCompletionSource"], "builtin", force_update=False)
+# Script tips: builtin XOR vtsls — pure vtsls when binary found (shadow+jsconfig+@types/node)
+_use_vtsls = (ok_vtsls == 1)
+setp(["lsp", "httpyac-lsp", "settings", "useBuiltinScriptCompletions"], (not _use_vtsls), force_update=True)
+setp(["lsp", "httpyac-lsp", "settings", "scriptCompletionSource"], ("vtsls" if _use_vtsls else "builtin"), force_update=True)
 setp(["httpyac", "use_builtin_script_completions"], True, force_update=False)
 
 if not changed:

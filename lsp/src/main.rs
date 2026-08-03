@@ -435,7 +435,8 @@ impl LanguageServer for HttpLsp {
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
+                    // true: Zed calls completionItem/resolve for detail + docs (auth-sign.js style)
+                    resolve_provider: Some(true),
                     // Include . @ $ > for httpyac script / meta / variables
                     trigger_characters: Some(
                         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ :/.@${}>"
@@ -558,7 +559,8 @@ impl LanguageServer for HttpLsp {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.vtsls.close(&params.text_document.uri).await;
+        // Never let vtsls close errors kill the parent LSP (switch-file crash).
+        let _ = self.vtsls.close(&params.text_document.uri).await;
         let mut docs = self.documents.write().await;
         docs.remove(&params.text_document.uri);
     }
@@ -637,6 +639,28 @@ impl LanguageServer for HttpLsp {
             Ok(r) => Ok(r),
             Err(_) => Ok(None),
         }
+    }
+
+    async fn completion_resolve(&self, params: CompletionItem) -> Result<CompletionItem> {
+        // Only resolve via child vtsls when script engine is vtsls.
+        if self.vtsls.script_source().await != ScriptCompletionSource::Vtsls {
+            return Ok(params);
+        }
+        let proxy = self.vtsls.proxy.lock().await;
+        if let Some(p) = proxy.as_ref() {
+            match p.completion_resolve(params.clone()).await {
+                Ok(item) => return Ok(item),
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("vtsls completion resolve: {e}"),
+                        )
+                        .await;
+                }
+            }
+        }
+        Ok(params)
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -796,6 +820,17 @@ impl HttpLsp {
         //   useBuiltinScriptCompletions: true  → builtin catalog only
         //   useBuiltinScriptCompletions: false → child vtsls only
         let source = self.vtsls.script_source().await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "httpyac-lsp completion: in_script={in_script} source={:?} line={} col={}",
+                    source.as_str(),
+                    position.line,
+                    position.character
+                ),
+            )
+            .await;
         match source {
             ScriptCompletionSource::Builtin => Ok(catalog_resp),
             ScriptCompletionSource::Vtsls => {
@@ -822,9 +857,21 @@ impl HttpLsp {
                             }
                         }
                     } else {
+                        self.client
+                            .log_message(
+                                MessageType::WARNING,
+                                "vtsls proxy not started (check vtslsCommand / PATH)",
+                            )
+                            .await;
                         Vec::new()
                     }
                 };
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("httpyac-lsp vtsls items={}", vtsls_items.len()),
+                    )
+                    .await;
                 if vtsls_items.is_empty() {
                     self.client
                         .log_message(
@@ -834,6 +881,60 @@ impl HttpLsp {
                         .await;
                     // Still empty — do not silently switch engines; user chose vtsls.
                     return Ok(None);
+                }
+                // ── Zed client-side filter: query is often `crypto.` / `request.st`
+                // Catalog sets filter_text = "path.name" so fuzzy match works.
+                // Raw vtsls items only have label "createHmac" → Zed drops them all.
+                let mut vtsls_items = vtsls_items;
+                {
+                    let lines: Vec<&str> = content.split('\n').collect();
+                    let line_idx = position.line as usize;
+                    let before = if line_idx < lines.len() {
+                        let line = lines[line_idx];
+                        let col = lsp_utf16_to_byte(line, position.character);
+                        &line[..col.min(line.len())]
+                    } else {
+                        ""
+                    };
+                    // path like "crypto", filter like "" or "cre"
+                    let (path, partial) = dotted_prefix(before)
+                        .or_else(|| {
+                            let t = before.trim_end();
+                            if t.ends_with('.') {
+                                let p = t.trim_end_matches('.').rsplit(|c: char| {
+                                    !c.is_ascii_alphanumeric() && c != '_' && c != '$'
+                                }).next().unwrap_or("").to_string();
+                                Some((p, String::new()))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    for it in &mut vtsls_items {
+                        // Keep insert label as bare member name for clean insert
+                        let name = it.label.clone();
+                        if !path.is_empty() {
+                            let (ft, lab) = member_filter_label(&path, &name);
+                            // label stays short for UI; filter_text carries path for Zed query
+                            it.filter_text = Some(ft);
+                            // Also put path.name into label_details description so ranking works
+                            if it.label_details.is_none() {
+                                it.label_details = Some(CompletionItemLabelDetails {
+                                    detail: None,
+                                    description: Some(lab),
+                                });
+                            }
+                        } else if !partial.is_empty() {
+                            // bare ident: signRe → ensure filter includes partial
+                            if it.filter_text.as_ref().map(|s| !s.contains(&partial)).unwrap_or(true) {
+                                it.filter_text = Some(format!("{} {}", name, partial));
+                            }
+                        }
+                        if it.sort_text.is_none() {
+                            it.sort_text = Some(format!("0{name}"));
+                        }
+                    }
+                    let _ = partial;
                 }
                 Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,

@@ -144,18 +144,42 @@ impl zed::Extension for HttpyacClientExtension {
         if !map.contains_key("vtslsEnabled") {
             map.insert("vtslsEnabled".into(), serde_json::Value::Bool(true));
         }
-        // Default script engine = builtin catalog (mutex with vtsls)
+        // Default to pure vtsls (user request) when vtsls available; otherwise safe builtin
         if !map.contains_key("useBuiltinScriptCompletions")
             && !map.contains_key("scriptCompletionSource")
+            && map.contains_key("vtslsCommand")
         {
             map.insert(
                 "useBuiltinScriptCompletions".into(),
-                serde_json::Value::Bool(true),
+                serde_json::Value::Bool(false),
             );
             map.insert(
                 "scriptCompletionSource".into(),
-                serde_json::Value::String("builtin".into()),
+                serde_json::Value::String("vtsls".into()),
             );
+        } else if !map.contains_key("useBuiltinScriptCompletions")
+            && !map.contains_key("scriptCompletionSource")
+        {
+            // Force vtsls when available (pure vtsls path)
+            if map.contains_key("vtslsCommand") && map.get("vtslsCommand").unwrap().as_str().is_some_and(|s| !s.is_empty()) {
+                map.insert(
+                    "useBuiltinScriptCompletions".into(),
+                    serde_json::Value::Bool(false),
+                );
+                map.insert(
+                    "scriptCompletionSource".into(),
+                    serde_json::Value::String("vtsls".into()),
+                );
+            } else {
+                map.insert(
+                    "useBuiltinScriptCompletions".into(),
+                    serde_json::Value::Bool(true),
+                );
+                map.insert(
+                    "scriptCompletionSource".into(),
+                    serde_json::Value::String("builtin".into()),
+                );
+            }
         }
         if map.is_empty() {
             Ok(None)

@@ -28,100 +28,7 @@ use tokio::sync::{oneshot, Mutex};
 use tower_lsp::lsp_types::*;
 use tower_lsp::Client;
 
-/// Ambient lines prepended to every virtual TS doc (httpyac script globals + Node stubs).
-///
-/// Critical: `require('crypto')` must **not** be typed as bare `any`, or `crypto.` after
-/// `const crypto = require('crypto')` yields **no member completions** in vtsls (while bare
-/// `crypt` still suggests global `Crypto` / DOM names — looks like “vtsls half works”).
-pub const AMBIENT_PREAMBLE: &str = r#"/* httpyac-lsp virtual buffer — do not edit */
-/** httpyac request object */
-declare const request: {
-  method: string;
-  url: string;
-  headers: Record<string, string> & { set?(k: string, v: string): void; get?(k: string): string };
-  body?: unknown;
-  [key: string]: unknown;
-};
-/** httpyac response object */
-declare const response: {
-  statusCode: number;
-  status: number;
-  headers: Record<string, string>;
-  body: string | unknown;
-  parsedBody?: unknown;
-  contentType?: string;
-  [key: string]: unknown;
-};
-declare const client: {
-  test(name: string, fn: () => void): void;
-  assert(cond: unknown, message?: string): void;
-  log(...args: unknown[]): void;
-  global: { get(k: string): unknown; set(k: string, v: unknown): void; clear(k?: string): void };
-  [key: string]: unknown;
-};
-declare const console: Console;
-declare const exports: Record<string, unknown>;
-declare function test(name: string, fn: () => void): void;
 
-// ── Node-ish stubs so require('crypto') | require('fs') | … get real `.` members ──
-interface HttpyacHash {
-  update(data: string | Uint8Array, inputEncoding?: string): HttpyacHash;
-  digest(): Buffer;
-  digest(encoding: string): string;
-}
-interface HttpyacHmac {
-  update(data: string | Uint8Array, inputEncoding?: string): HttpyacHmac;
-  digest(): Buffer;
-  digest(encoding: string): string;
-}
-interface HttpyacNodeCrypto {
-  createHmac(algorithm: string, key: string | Uint8Array): HttpyacHmac;
-  createHash(algorithm: string): HttpyacHash;
-  createSign(algorithm: string): { update(data: string | Uint8Array): any; sign(key: string, enc?: string): string | Buffer };
-  createVerify(algorithm: string): { update(data: string | Uint8Array): any; verify(key: string, sig: string, enc?: string): boolean };
-  randomBytes(size: number): Buffer;
-  randomUUID(): string;
-  pbkdf2Sync(password: string, salt: string, iterations: number, keylen: number, digest: string): Buffer;
-  scryptSync(password: string, salt: string, keylen: number): Buffer;
-  [key: string]: unknown;
-}
-interface HttpyacNodeFs {
-  readFileSync(path: string, encoding?: string): string | Buffer;
-  writeFileSync(path: string, data: string | Uint8Array, encoding?: string): void;
-  existsSync(path: string): boolean;
-  readdirSync(path: string): string[];
-  statSync(path: string): { isFile(): boolean; isDirectory(): boolean; size: number };
-  [key: string]: unknown;
-}
-interface HttpyacNodePath {
-  join(...parts: string[]): string;
-  resolve(...parts: string[]): string;
-  dirname(p: string): string;
-  basename(p: string, ext?: string): string;
-  extname(p: string): string;
-  normalize(p: string): string;
-  [key: string]: unknown;
-}
-interface HttpyacNodeBuffer {
-  from(data: string | ArrayBuffer | ArrayLike<number>, encoding?: string): Buffer;
-  alloc(size: number, fill?: string | number, encoding?: string): Buffer;
-  concat(list: Buffer[], totalLength?: number): Buffer;
-  isBuffer(obj: unknown): obj is Buffer;
-  [key: string]: unknown;
-}
-/** Overloads: known Node modules get shapes; other ids stay any. */
-declare function require(id: 'crypto'): HttpyacNodeCrypto;
-declare function require(id: 'node:crypto'): HttpyacNodeCrypto;
-declare function require(id: 'fs'): HttpyacNodeFs;
-declare function require(id: 'node:fs'): HttpyacNodeFs;
-declare function require(id: 'path'): HttpyacNodePath;
-declare function require(id: 'node:path'): HttpyacNodePath;
-declare function require(id: 'buffer'): { Buffer: HttpyacNodeBuffer };
-declare function require(id: 'node:buffer'): { Buffer: HttpyacNodeBuffer };
-declare function require(id: string): any;
-
-export {};
-"#;
 
 /// Which engine answers **script-island** completions (Host / `{{var}}` always catalog).
 /// **Mutually exclusive** — never merge both in one popup.
@@ -348,43 +255,88 @@ fn which_ok(name: &str) -> bool {
 ///
 /// Returns `(js_text, preamble_lines)` where `preamble_lines` is **0** so LSP
 /// positions map 1:1 with the `.http` buffer.
+///
+/// Only script islands are emitted:
+/// - multi-line `{{ … }}` pre/post request blocks
+/// - `> {% … %}` / handler percent blocks
+/// - true inline JS lines (const/require/…) — never HTTP comments like `## …`
 pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
     let mut out = String::new();
-    let mut in_mustache = false; // {{ … }}
+    let mut in_mustache = false; // multi-line {{ … }}
     let mut in_percent = false; // {% … %}
 
     for line in http_src.lines() {
         let trim = line.trim();
         let mut emit = String::new();
 
+        // ── percent handlers: > {% … %} ──
         if trim.contains("{%") {
             in_percent = true;
         }
-        if trim.contains("%}") {
-            if in_percent {
+        if in_percent {
+            if trim.contains("%}") {
                 in_percent = false;
                 out.push('\n');
                 continue;
             }
+            // Skip the opening `{%` line itself; emit body only
+            if !trim.contains("{%") {
+                let body = line.strip_prefix('>').unwrap_or(line);
+                let body = body.strip_prefix('<').unwrap_or(body);
+                emit = body.to_string();
+            }
+            out.push_str(&emit);
+            out.push('\n');
+            continue;
         }
 
-        if trim == "{{" || (trim.starts_with("{{") && trim.ends_with("}}") && trim.len() > 4) {
-            if trim.starts_with("{{") && trim.ends_with("}}") && !trim[2..].contains("{{") {
-                let inner = trim.trim_start_matches("{{").trim_end_matches("}}").trim();
-                emit = inner.to_string();
-            } else if trim == "{{" || (trim.starts_with("{{") && !trim.contains("}}")) {
-                in_mustache = true;
+        // ── multi-line {{ script }} (httpyac pre/post request) ──
+        // Single-line {{ var }} is a mustache *variable*, not a script — leave blank.
+        if trim == "{{" {
+            in_mustache = true;
+            out.push('\n');
+            continue;
+        }
+        if in_mustache {
+            if trim == "}}" || trim.starts_with("}}") {
+                in_mustache = false;
+                out.push('\n');
+                continue;
             }
-        } else if trim == "}}" || (trim.ends_with("}}") && in_mustache) {
-            in_mustache = false;
-        } else if in_mustache || in_percent {
             let body = line.strip_prefix('>').unwrap_or(line);
             let body = body.strip_prefix('<').unwrap_or(body);
+            // Keep indentation so column maps stay 1:1 with .http
             emit = body.to_string();
-            if matches!(emit.trim(), "{%" | "%}" | "{{" | "}}") {
-                emit.clear();
+            out.push_str(&emit);
+            out.push('\n');
+            continue;
+        }
+
+        // ── single-line {{ expr }} that is pure JS (rare) — not {{var}} in URL/header ──
+        if trim.starts_with("{{") && trim.ends_with("}}") && trim.len() > 4 {
+            let inner = trim
+                .trim_start_matches("{{")
+                .trim_end_matches("}}")
+                .trim();
+            // Only emit if it looks like real JS, not a bare variable name / path
+            if looks_like_inline_script_line(inner)
+                && !inner.contains('/')
+                && !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                emit = format!("  {inner}");
+            } else if looks_like_js_statement(inner) {
+                emit = format!("  {inner}");
             }
-        } else if looks_like_inline_script_line(trim) {
+            out.push_str(&emit);
+            out.push('\n');
+            continue;
+        }
+
+        // ── bare inline JS (no braces) — strict, never HTTP comments ──
+        if !trim.starts_with('#')
+            && !trim.starts_with('@')
+            && looks_like_inline_script_line(trim)
+        {
             emit = line.to_string();
         }
 
@@ -395,12 +347,60 @@ pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
     (out, 0)
 }
 
+/// True JS statement (const/let/require/exports/…) — not a bare mustache var.
+fn looks_like_js_statement(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("const ")
+        || t.starts_with("let ")
+        || t.starts_with("var ")
+        || t.starts_with("function ")
+        || t.starts_with("await ")
+        || t.starts_with("async ")
+        || t.starts_with("return ")
+        || t.contains("require(")
+        || t.contains("exports.")
+        || t.contains("=")
+}
+
+/// Inline script heuristics. **Must not** match HTTP prose like
+/// `## Uses http-client.env.json` (false positive on bare `client.`).
 fn looks_like_inline_script_line(trim: &str) -> bool {
+    // Never treat httpyac/markdown comments as script outside mustache blocks
+    if trim.starts_with('#') {
+        return false;
+    }
     const SIG: &[&str] = &[
-        "const ", "let ", "var ", "function ", "await ", "async ", "require(", "exports.",
-        "response.", "request.", "client.", "console.", "crypto.", "return ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "await ",
+        "async ",
+        "require(",
+        "exports.",
+        "response.",
+        "request.",
+        "console.",
+        "crypto.",
+        "return ",
+        "Buffer.",
+        "JSON.",
+        "Math.",
     ];
-    SIG.iter().any(|s| trim.contains(s))
+    if SIG.iter().any(|s| trim.contains(s)) {
+        return true;
+    }
+    // `client.` only as a free identifier (not `http-client.env`)
+    if let Some(idx) = trim.find("client.") {
+        let ok_before = idx == 0
+            || (!trim.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                && trim.as_bytes()[idx - 1] != b'-'
+                && trim.as_bytes()[idx - 1] != b'_');
+        if ok_before {
+            return true;
+        }
+    }
+    false
 }
 
 /// Map HTTP LSP position → virtual TS position (add preamble lines).
@@ -423,9 +423,20 @@ pub fn virtual_pos_to_http(pos: Position, preamble_lines: u32) -> Position {
 /// Example: `examples/environments.http` → `examples/environments.http.__vtsls__.js`
 pub fn shadow_js_path(http_uri: &Url) -> Option<PathBuf> {
     let p = http_uri.to_file_path().ok()?;
-    let mut s = p.into_os_string();
-    s.push(".__vtsls__.js");
-    Some(PathBuf::from(s))
+    // /tmp/httpyac-vtsls/<stable-hash>/name.http.__vtsls__.js
+    // PathBuf::join ignores prefix if second is absolute — so hash the full path.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    p.hash(&mut h);
+    let hash = format!("{:x}", h.finish());
+    let fname = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "doc.http".into());
+    let dir = std::env::temp_dir().join("httpyac-vtsls").join(&hash);
+    let _ = fs::create_dir_all(&dir);
+    Some(dir.join(format!("{fname}.__vtsls__.js")))
 }
 
 fn virtual_uri_for(http_uri: &Url) -> Url {
@@ -442,8 +453,157 @@ fn virtual_uri_for(http_uri: &Url) -> Url {
     Url::parse(&format!("{s}.__vtsls__.js")).unwrap_or_else(|_| http_uri.clone())
 }
 
-/// Ensure a `jsconfig.json` next to the HTTP file so tsserver treats the shadow
-/// `.js` like `examples/scripts/auth-sign.js` (Node `@types`, checkJs, commonjs).
+/// Symlink useful project entries into the tmp shadow dir so relative
+/// `require('./scripts/…')` resolves like a real file next to the .http.
+fn link_http_dir_into_shadow(shadow_dir: &Path, http_dir: &Path) {
+    // scripts/ is the main relative-require target
+    // Only link scripts/ + node_modules — NEVER project jsconfig.json
+    // (linking jsconfig into tmp made Zed/json-ls open a broken path and spam errors).
+    for name in ["scripts", "node_modules"] {
+        let src = http_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = shadow_dir.join(name);
+        if dst.exists() || dst.symlink_metadata().is_ok() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&src, &dst);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = src;
+            let _ = dst;
+        }
+    }
+}
+
+/// Rewrite `require('./rel')` / `require("../rel")` to absolute paths based on
+/// the real `.http` directory (shadow lives under $TMPDIR). Kept as fallback.
+#[allow(dead_code)]
+fn rewrite_relative_requires(js: &str, http_dir: &Path) -> String {
+    // Minimal scanner: require('…') / require("…")
+    let mut out = String::with_capacity(js.len() + 64);
+    let bytes = js.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 9 <= bytes.len() && &js[i..i + 8] == "require(" {
+            out.push_str("require(");
+            i += 8;
+            // skip ws
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+                let quote = bytes[i] as char;
+                out.push(quote);
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] as char != quote {
+                    i += 1;
+                }
+                let spec = &js[start..i];
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    let abs = http_dir.join(spec);
+                    let abs = abs.canonicalize().unwrap_or(abs);
+                    out.push_str(&abs.to_string_lossy());
+                } else {
+                    out.push_str(spec);
+                }
+
+                if i < bytes.len() {
+                    out.push(quote);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// jsconfig inside the /tmp shadow dir; baseUrl = real http folder for module resolve.
+fn ensure_jsconfig_for_shadow_dir(shadow_dir: &Path, http_dir: &Path) -> Result<(), String> {
+    let jsconfig = shadow_dir.join("jsconfig.json");
+    let mut type_roots: Vec<String> = Vec::new();
+    if http_dir.join("node_modules/@types").is_dir() {
+        type_roots.push(http_dir.join("node_modules/@types").to_string_lossy().into());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cache = PathBuf::from(&home).join("Library/Caches/typescript");
+        if let Ok(rd) = std::fs::read_dir(&cache) {
+            for ent in rd.flatten() {
+                let tr = ent.path().join("node_modules/@types");
+                if tr.is_dir() {
+                    type_roots.push(tr.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    let mut compiler: serde_json::Map<String, Value> = serde_json::Map::new();
+    compiler.insert("module".into(), json!("commonjs"));
+    compiler.insert("target".into(), json!("ES2020"));
+    compiler.insert("checkJs".into(), json!(true));
+    compiler.insert("strict".into(), json!(false));
+    compiler.insert("noEmit".into(), json!(true));
+    compiler.insert("moduleResolution".into(), json!("node"));
+    compiler.insert("types".into(), json!(["node"]));
+    compiler.insert("baseUrl".into(), json!(http_dir.to_string_lossy()));
+    if !type_roots.is_empty() {
+        compiler.insert("typeRoots".into(), json!(type_roots));
+    }
+    let doc = json!({
+        "compilerOptions": compiler,
+        "include": ["./**/*.js", "./**/*.__vtsls__.js"]
+    });
+    // httpyac globals in the tmp dir
+    let globals = shadow_dir.join("httpyac-vtsls-globals.d.ts");
+    if !globals.is_file() {
+        let _ = fs::write(
+            &globals,
+            r#"/** Auto-generated for httpyac-lsp child vtsls — httpyac script globals */
+declare const request: {
+  method: string;
+  url: string;
+  headers: Record<string, string> & { set?(k: string, v: string): void; get?(k: string): string };
+  body?: unknown;
+  [key: string]: unknown;
+};
+declare const response: {
+  statusCode: number;
+  status: number;
+  headers: Record<string, string>;
+  body: string | unknown;
+  parsedBody?: unknown;
+  [key: string]: unknown;
+};
+declare const client: {
+  test(name: string, fn: () => void): void;
+  assert(cond: unknown, message?: string): void;
+  log(...args: unknown[]): void;
+  global: { get(k: string): unknown; set(k: string, v: unknown): void; clear(k?: string): void };
+  [key: string]: unknown;
+};
+declare const exports: Record<string, unknown>;
+declare function test(name: string, fn: () => void): void;
+"#,
+        );
+    }
+    fs::write(
+        &jsconfig,
+        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| format!("write jsconfig.json: {e}"))?;
+    Ok(())
+}
+
+/// Test-only: write jsconfig into an arbitrary dir (never used for project trees in prod).
+#[cfg(test)]
 fn ensure_jsconfig_for_http_dir(http_dir: &Path) -> Result<(), String> {
     let jsconfig = http_dir.join("jsconfig.json");
     if jsconfig.is_file() {
@@ -731,16 +891,23 @@ impl VtslsProxy {
         }
     }
 
-    /// Sync script islands into a **real on-disk `.js` shadow file** (same layout as
-    /// opening `auth-sign.js` under jsconfig + `@types/node`), then tell vtsls.
+    /// Sync script islands into a **real on-disk `.js` shadow file** under
+    /// `$TMPDIR/httpyac-vtsls/<hash>/` (not the project tree), then tell vtsls.
     pub async fn sync_document(&self, http_uri: &Url, http_text: &str) -> Result<(), String> {
         let (virtual_text, preamble) = build_virtual_typescript(http_text);
         debug_assert_eq!(preamble, 0, "shadow JS must stay line-aligned with .http");
 
-        // Materialize beside the .http file so require()/jsconfig match real JS buffers.
+        // Materialize under $TMPDIR; symlink real http dir entries so
+        // require('./scripts/…') still works without rewriting paths.
         if let Some(shadow) = shadow_js_path(http_uri) {
-            if let Some(dir) = shadow.parent() {
-                let _ = ensure_jsconfig_for_http_dir(dir);
+            if let Ok(http_path) = http_uri.to_file_path() {
+                if let Some(http_dir) = http_path.parent() {
+                    if let Some(dir) = shadow.parent() {
+                        let _ = fs::create_dir_all(dir);
+                        link_http_dir_into_shadow(dir, http_dir);
+                        let _ = ensure_jsconfig_for_shadow_dir(dir, http_dir);
+                    }
+                }
             }
             if let Some(parent) = shadow.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -845,6 +1012,43 @@ impl VtslsProxy {
         Ok(map_completion_response(raw, self.preamble_lines))
     }
 
+    /// Forward `completionItem/resolve` to child vtsls so detail + documentation
+    /// match native JS (auth-sign.js). Initial completion often omits docs.
+    ///
+    /// With `completeFunctionCalls: true`, resolve fills insert_text as a snippet
+    /// e.g. `.createHmac(${1:algorithm}, ${2:key}$3)$0`. Zed prefers `text_edit`
+    /// over `insert_text`, so we must copy the snippet into text_edit.new_text
+    /// (keeping the original range) — otherwise Enter only inserts the bare name.
+    pub async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem, String> {
+        let keep_label = item.label.clone();
+        let keep_filter = item.filter_text.clone();
+        let keep_sort = item.sort_text.clone();
+        let keep_range = item.text_edit.as_ref().map(|e| match e {
+            CompletionTextEdit::Edit(t) => t.range,
+            CompletionTextEdit::InsertAndReplace(ir) => ir.replace,
+        });
+        let raw_item = serde_json::to_value(&item).map_err(|e| e.to_string())?;
+        let raw = self.request("completionItem/resolve", raw_item).await?;
+        if raw.is_null() {
+            return Ok(item);
+        }
+        let mut resolved: CompletionItem = serde_json::from_value(raw)
+            .map_err(|e| format!("completion resolve decode: {e}"))?;
+        fix_completion_item_ranges(&mut resolved, self.preamble_lines);
+        // Preserve fuzzy-match fields Zed already committed to
+        resolved.label = keep_label;
+        if keep_filter.is_some() {
+            resolved.filter_text = keep_filter;
+        }
+        if keep_sort.is_some() {
+            resolved.sort_text = keep_sort;
+        }
+        // Apply completeFunctionCalls snippet into text_edit (Zed uses text_edit on accept)
+        apply_function_call_snippet(&mut resolved, keep_range);
+        tag_vtsls_origin(&mut resolved);
+        Ok(resolved)
+    }
+
     pub async fn hover(
         &self,
         http_uri: &Url,
@@ -897,6 +1101,45 @@ impl VtslsProxy {
     }
 }
 
+/// If resolve gave a snippet insert_text with `(…)`, put it into text_edit so
+/// Enter inserts `createHmac(${1:algorithm}, ${2:key})` not bare `createHmac`.
+fn apply_function_call_snippet(item: &mut CompletionItem, keep_range: Option<Range>) {
+    let snippet = match item.insert_text.as_ref() {
+        Some(s) if s.contains('(') => s.clone(),
+        _ => return,
+    };
+    if item.insert_text_format.is_none()
+        || item.insert_text_format == Some(InsertTextFormat::PLAIN_TEXT)
+    {
+        if snippet.contains("${") || snippet.contains("$0") || snippet.contains("$1") {
+            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+        }
+    }
+    match item.text_edit.as_mut() {
+        Some(CompletionTextEdit::Edit(e)) => {
+            if !e.new_text.contains('(') {
+                e.new_text = snippet;
+            }
+            if let Some(r) = keep_range {
+                e.range = r;
+            }
+        }
+        Some(CompletionTextEdit::InsertAndReplace(ir)) => {
+            if !ir.new_text.contains('(') {
+                ir.new_text = snippet;
+            }
+        }
+        None => {
+            if let Some(r) = keep_range {
+                item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                    range: r,
+                    new_text: snippet,
+                }));
+            }
+        }
+    }
+}
+
 fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionResponse> {
     if raw.is_null() {
         return None;
@@ -913,6 +1156,9 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
                 if it.sort_text.is_none() {
                     it.sort_text = Some(format!("0{}", it.label));
                 }
+                // The real filter_text rewrite (generic for any require()) is done in main.rs completion_inner
+                // after vtsls returns items, using member_filter_label(&path, name)
+                // where path comes from dotted_prefix(before_cursor)
                 it
             })
             .collect();
@@ -926,6 +1172,10 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
         for it in &mut list.items {
             fix_completion_item_ranges(it, preamble);
             tag_vtsls_origin(it);
+            if it.sort_text.is_none() {
+                it.sort_text = Some(format!("0{}", it.label));
+            }
+            // filter_text rewrite (generic for any require()) is done in main.rs completion_inner
         }
         if list.items.is_empty() {
             return None;
@@ -935,31 +1185,14 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
     None
 }
 
+/// Keep vtsls/tsserver completion UI **as-is** (same as opening auth-sign.js):
+/// - `detail`: function signature / type (`function createHmac(...): Hmac`)
+/// - `documentation`: real JSDoc / @types docs on the right pane
+///
+/// Do **not** overwrite with "[vtsls] via httpyac-lsp…" — that is what made the
+/// popup look like garbage compared to native JS completions.
 fn tag_vtsls_origin(item: &mut CompletionItem) {
-    match item.detail.as_mut() {
-        None => item.detail = Some("[vtsls]".into()),
-        Some(d) if d.contains("[vtsls]") || d.contains("vtsls") => {}
-        Some(d) => *d = format!("[vtsls] {d}"),
-    }
-    // Documentation sidebar (when Zed shows it)
-    match &mut item.documentation {
-        None => {
-            item.documentation = Some(Documentation::String(
-                "[vtsls] via httpyac-lsp child process (@vtsls/language-server)".into(),
-            ));
-        }
-        Some(Documentation::String(s)) => {
-            if !s.contains("[vtsls]") {
-                *s = format!("[vtsls] {s}");
-            }
-        }
-        Some(Documentation::MarkupContent(m)) => {
-            if !m.value.contains("[vtsls]") {
-                m.value = format!("[vtsls] {}", m.value);
-            }
-        }
-    }
-    // Drop private vtsls cache commands Zed cannot run
+    // Only strip private commands Zed cannot execute; leave label/detail/docs alone.
     if item
         .command
         .as_ref()
@@ -1069,11 +1302,22 @@ fn server_request_result(method: &str, params: &Value) -> Value {
                 .and_then(|i| i.as_array())
                 .map(|a| a.len())
                 .unwrap_or(1);
+            // completeFunctionCalls: true → accept insert is createHmac($1, $2) like auth-sign.js
+            // (was false → only bare name createHmac)
             let cfg = json!({
                 "typescript": {
-                    "suggest": { "enabled": true, "paths": true, "autoImports": true },
+                    "suggest": {
+                        "enabled": true,
+                        "paths": true,
+                        "autoImports": true,
+                        "completeFunctionCalls": true
+                    },
                     "tsserver": { "useSyntaxServer": "auto" },
-                    "preferences": { "includePackageJsonAutoImports": "on" },
+                    "preferences": {
+                        "includePackageJsonAutoImports": "on",
+                        "includeCompletionsWithSnippetText": true,
+                        "includeCompletionsForModuleExports": true
+                    },
                     "disableAutomaticTypeAcquisition": false
                 },
                 "javascript": {
@@ -1082,9 +1326,13 @@ fn server_request_result(method: &str, params: &Value) -> Value {
                         "paths": true,
                         "autoImports": true,
                         "names": true,
-                        "completeFunctionCalls": false
+                        "completeFunctionCalls": true
                     },
-                    "preferences": { "includePackageJsonAutoImports": "on" },
+                    "preferences": {
+                        "includePackageJsonAutoImports": "on",
+                        "includeCompletionsWithSnippetText": true,
+                        "includeCompletionsForModuleExports": true
+                    },
                     "validate": { "enable": true }
                 },
                 // Implicit project when no jsconfig (backup)
@@ -1160,13 +1408,23 @@ async fn read_lsp_stdout(
                 content_length = rest.trim().parse().ok();
             }
         }
-        let len = content_length.ok_or("vtsls message missing Content-Length")?;
+        // Missing Content-Length: skip garbage (do NOT kill the reader — that
+        // used to end the task and make all later completions hang / look like crash).
+        let Some(len) = content_length else {
+            continue;
+        };
+        if len == 0 || len > 64 * 1024 * 1024 {
+            continue;
+        }
         let mut buf = vec![0u8; len];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-        let msg: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+        if let Err(_e) = reader.read_exact(&mut buf).await {
+            // Child closed or partial — exit cleanly, don't poison parent LSP
+            return Ok(());
+        }
+        let msg: Value = match serde_json::from_slice(&buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
         let has_id = msg.get("id").is_some();
         let method = msg.get("method").and_then(|m| m.as_str());
@@ -1398,6 +1656,109 @@ Host: x
         }));
         assert_eq!(disabled.script_source(), ScriptCompletionSource::Builtin);
     }
+
+    #[test]
+    fn shadow_path_and_jsconfig_match_real_js_project_shape() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let http = root.join("script-vtsls.http");
+        let uri = Url::from_file_path(&http).expect("file uri");
+        let shadow = shadow_js_path(&uri).expect("shadow path");
+        assert!(
+            shadow
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.ends_with(".__vtsls__.js")),
+            "shadow must be *.__vtsls__.js beside .http, got {}",
+            shadow.display()
+        );
+        // Shadow lives under $TMPDIR/httpyac-vtsls/<hash>/ (not project dir)
+        let parent = shadow.parent().expect("parent");
+        assert!(
+            parent.to_string_lossy().contains("httpyac-vtsls"),
+            "shadow must be under httpyac-vtsls tmp dir, got {}",
+            parent.display()
+        );
+
+        // Ensure jsconfig materialization (idempotent if already present from prior runs)
+        let dir = http.parent().unwrap();
+        // Use a temp subdir so we don't clobber a real examples/jsconfig the user may want
+        let tmp = std::env::temp_dir().join(format!(
+            "httpyac-vtsls-jsconfig-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        ensure_jsconfig_for_http_dir(&tmp).expect("jsconfig");
+        let jc = fs::read_to_string(tmp.join("jsconfig.json")).expect("read jsconfig");
+        assert!(
+            jc.contains("\"node\"") || jc.contains("types"),
+            "jsconfig must request @types/node: {jc}"
+        );
+        assert!(
+            jc.contains("commonjs") || jc.contains("CommonJS") || jc.contains("commonjs"),
+            "jsconfig module should be commonjs-like: {jc}"
+        );
+        assert!(
+            tmp.join("httpyac-vtsls-globals.d.ts").is_file(),
+            "httpyac globals d.ts must exist for request/response"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = dir; // silence
+    }
+
+    #[test]
+    fn http_cursor_maps_1to1_when_preamble_zero() {
+        // Shipped proxy uses preamble_lines=0 for plain JS shadows
+        let http_line = 31u32;
+        let http_col = 9u32;
+        let pos = Position {
+            line: http_line,
+            character: http_col,
+        };
+        let v = http_pos_to_virtual(pos, 0);
+        assert_eq!(v.line, http_line);
+        assert_eq!(v.character, http_col);
+        let back = virtual_pos_to_http(v, 0);
+        assert_eq!(back.line, http_line);
+        assert_eq!(back.character, http_col);
+    }
+
+    #[test]
+    fn environments_http_shadow_has_script_not_header_noise() {
+        // Synthetic buffer matching user shape (crypto. after require) — not disk dirty state
+        let http = "### POST\n{{\n  const crypto = require('crypto');\n  crypto.\n  const date = new Date();\n}}\n";
+        let (virt, preamble) = build_virtual_typescript(http);
+        assert_eq!(preamble, 0);
+        assert_eq!(virt.lines().count(), http.lines().count(), "1:1 line align");
+        assert!(virt.contains("require('crypto')"), "missing require: {virt}");
+        assert!(
+            virt.lines().any(|l| l.trim().starts_with("crypto.")),
+            "missing crypto. line: {virt}"
+        );
+        // False positive fixed: HTTP comment with http-client.env must NOT leak
+        let noisy = "## Uses http-client.env.json in this folder\n{{\n  const x = 1;\n}}\n";
+        let (v2, _) = build_virtual_typescript(noisy);
+        assert!(
+            !v2.contains("http-client.env"),
+            "header comment polluted shadow via client. false positive:\n{v2}"
+        );
+        assert!(!virt.contains("GET {{"), "HTTP lines must be blanked");
+        assert!(!virt.contains("POST {{"), "HTTP lines must be blanked");
+    }
+
+
+    #[test]
+    fn client_dot_false_positive_not_in_http_comment() {
+        assert!(!looks_like_inline_script_line(
+            "## Uses http-client.env.json in this folder (keys: dev, prod, staging)."
+        ));
+        assert!(looks_like_inline_script_line("client.test('x', () => {})"));
+        assert!(looks_like_inline_script_line("const crypto = require('crypto');"));
+        assert!(looks_like_inline_script_line("crypto."));
+    }
 }
 
 #[cfg(test)]
@@ -1477,13 +1838,12 @@ POST https://example.com
         };
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         let res = proxy.completion(&uri, pos, None).await.expect("ok");
-        let labels: Vec<String> = match res {
-            Some(CompletionResponse::Array(items)) => {
-                items.into_iter().map(|i| i.label).collect()
-            }
-            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|i| i.label).collect(),
+        let items: Vec<CompletionItem> = match res {
+            Some(CompletionResponse::Array(items)) => items,
+            Some(CompletionResponse::List(l)) => l.items,
             None => vec![],
         };
+        let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
         eprintln!(
             "shadow={} n={} first40={:?}",
             shadow.display(),
@@ -1496,6 +1856,60 @@ POST https://example.com
             }),
             "expected Node crypto members like auth-sign.js, got {labels:?}"
         );
+        // .http cursor line must match textEdit line (1:1 mapping)
+        for it in items.iter().filter(|i| {
+            i.label.contains("createHmac") || i.label.contains("createHash")
+        }) {
+            if let Some(CompletionTextEdit::Edit(edit)) = &it.text_edit {
+                assert_eq!(
+                    edit.range.start.line, line,
+                    "crypto member textEdit line must be {line}, got {:?}",
+                    edit.range
+                );
+            }
+            eprintln!(
+                "ITEM {} insert={:?} format={:?} text_edit={:?} detail={:?}",
+                it.label,
+                it.insert_text,
+                it.insert_text_format,
+                it.text_edit.as_ref().map(|e| match e {
+                    CompletionTextEdit::Edit(t) => t.new_text.clone(),
+                    CompletionTextEdit::InsertAndReplace(ir) => ir.new_text.clone(),
+                }),
+                it.detail
+            );
+        }
+        // completeFunctionCalls:true → accept should insert createHmac(...) not bare name
+        let hmac = items.iter().find(|i| i.label == "createHmac" || i.label.starts_with("createHmac"));
+        if let Some(it) = hmac {
+            let resolved = proxy.completion_resolve(it.clone()).await.expect("resolve");
+            eprintln!(
+                "RESOLVED createHmac insert={:?} format={:?} text_edit={:?} detail={:?} kind={:?}",
+                resolved.insert_text,
+                resolved.insert_text_format,
+                resolved.text_edit.as_ref().map(|e| match e {
+                    CompletionTextEdit::Edit(t) => t.new_text.clone(),
+                    CompletionTextEdit::InsertAndReplace(ir) => ir.new_text.clone(),
+                }),
+                resolved.detail,
+                resolved.kind
+            );
+            let inserted = resolved
+                .insert_text
+                .clone()
+                .or_else(|| {
+                    resolved.text_edit.as_ref().map(|e| match e {
+                        CompletionTextEdit::Edit(t) => t.new_text.clone(),
+                        CompletionTextEdit::InsertAndReplace(ir) => ir.new_text.clone(),
+                    })
+                })
+                .unwrap_or_else(|| resolved.label.clone());
+            eprintln!("createHmac final insert = {inserted:?}");
+            assert!(
+                inserted.contains('('),
+                "accept must insert call with params like JS, got {inserted:?}"
+            );
+        }
     }
 
     /// Parity with auth-sign.js: after require destructure, typing `signRe` → signRequest.
@@ -1525,16 +1939,34 @@ POST https://example.com
         let pos = Position { line, character: col };
         tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         let res = proxy.completion(&uri, pos, None).await.expect("completion");
-        let labels: Vec<String> = match res {
-            Some(CompletionResponse::Array(i)) => i.into_iter().map(|x| x.label).collect(),
-            Some(CompletionResponse::List(l)) => l.items.into_iter().map(|x| x.label).collect(),
+        let items: Vec<CompletionItem> = match res {
+            Some(CompletionResponse::Array(i)) => i,
+            Some(CompletionResponse::List(l)) => l.items,
             None => vec![],
         };
-        eprintln!("n={} labels(prefix sign)={:?}", labels.len(), labels.iter().filter(|l| l.to_lowercase().contains("sign")).collect::<Vec<_>>());
+        let labels: Vec<String> = items.iter().map(|x| x.label.clone()).collect();
+        eprintln!(
+            "n={} labels(prefix sign)={:?}",
+            labels.len(),
+            labels
+                .iter()
+                .filter(|l| l.to_lowercase().contains("sign"))
+                .collect::<Vec<_>>()
+        );
         assert!(
             labels.iter().any(|l| l.contains("signRequest")),
             "like auth-sign.js, signRe must complete to signRequest; got {labels:?}"
         );
+        // Position mapping: textEdit must land on the same .http line as the cursor
+        for it in items.iter().filter(|i| i.label.contains("signRequest")) {
+            if let Some(CompletionTextEdit::Edit(edit)) = &it.text_edit {
+                assert_eq!(
+                    edit.range.start.line, line,
+                    "textEdit must target .http cursor line {line}, got {:?}",
+                    edit.range
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1563,5 +1995,160 @@ POST https://example.com
         assert!(labels.iter().any(|l| l.contains("update") || l.contains("digest")), "{labels:?}");
     }
 
-}
+    /// Zed query for `crypto.` is the string "crypto." — raw vtsls labels like
+    /// "createHmac" get client-filtered out. Catalog uses filter_text = "crypto.createHmac".
+    /// This test drives the same rewrite main.rs applies and asserts Zed would keep items.
+    #[test]
+    fn zed_filter_text_keeps_crypto_dot_members() {
+        // Simulate what completion_inner does after vtsls returns bare labels
+        let before = "  crypto.";
+        let (path, partial) = crate::completions::dotted_prefix(before).unwrap_or_default();
+        assert_eq!(path, "crypto");
+        assert_eq!(partial, "");
+        let bare_labels = ["createHmac", "createHash", "randomBytes"];
+        let mut kept = 0;
+        for name in bare_labels {
+            let (ft, _lab) = crate::completions::member_filter_label(&path, name);
+            // Zed fuzzy-matches query "crypto." against filter_text
+            let query = "crypto.";
+            let matches = ft.to_lowercase().contains(&query.to_lowercase().trim_end_matches('.').to_string())
+                || ft.starts_with("crypto.")
+                || ft.contains(query);
+            // Our filter_text is "crypto.createHmac" which starts with "crypto."
+            assert!(
+                ft.starts_with("crypto."),
+                "filter_text must be path.name for Zed, got {ft}"
+            );
+            assert!(
+                ft.contains(name),
+                "filter_text must contain member name"
+            );
+            if ft.starts_with("crypto.") {
+                kept += 1;
+            }
+            let _ = matches;
+        }
+        assert_eq!(kept, 3, "all three members must survive Zed-style filter");
+    }
 
+    #[tokio::test]
+    async fn real_environments_http_crypto_completion() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+
+        // Exact user buffer shape (crypto. after require) — not relying on disk dirty state
+        let http = "### POST with auth_token from env\n{{\n  //pre request script\n  const crypto = require('crypto');\n  crypto.\n  const date = new Date();\n}}\nPOST https://example.com\n";
+        let uri = Url::from_file_path(root.join("environments.http")).expect("uri");
+        proxy.sync_document(&uri, http).await.expect("sync");
+
+        let shadow = shadow_js_path(&uri).expect("shadow path");
+        let shadow_txt = fs::read_to_string(&shadow).expect("read shadow");
+        assert!(
+            shadow_txt.contains("require('crypto')"),
+            "shadow missing require crypto; content:\n{shadow_txt}"
+        );
+        assert!(
+            shadow_txt.lines().any(|l| l.trim().starts_with("crypto.")),
+            "shadow missing crypto. line; content:\n{shadow_txt}"
+        );
+        assert!(
+            !shadow_txt.contains("http-client.env"),
+            "shadow polluted by HTTP comment: {shadow_txt}"
+        );
+
+        let line = http
+            .lines()
+            .position(|l| l.trim().starts_with("crypto."))
+            .expect("crypto. line") as u32;
+        let col = http.lines().nth(line as usize).map(|l| l.len() as u32).unwrap_or(9);
+        let pos = Position {
+            line,
+            character: col,
+        };
+        eprintln!("crypto. at line={line} col={col}");
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let res = proxy.completion(&uri, pos, None).await.expect("completion");
+        let items: Vec<CompletionItem> = match res {
+            Some(CompletionResponse::Array(i)) => i,
+            Some(CompletionResponse::List(l)) => l.items,
+            None => vec![],
+        };
+        let labels: Vec<String> = items.iter().map(|x| x.label.clone()).collect();
+        eprintln!(
+            "n={} first30={:?}",
+            labels.len(),
+            &labels[..labels.len().min(30)]
+        );
+        assert!(
+            labels.iter().any(|l| {
+                l.contains("createHmac") || l.contains("createHash") || l.contains("randomBytes")
+            }),
+            "crypto. must complete via vtsls+@types/node; got {labels:?}"
+        );
+        // Apply same filter_text rewrite as main.rs completion_inner
+        let before = http.lines().nth(line as usize).unwrap();
+        let (path, _) = crate::completions::dotted_prefix(before).unwrap_or_default();
+        assert_eq!(path, "crypto", "dotted_prefix must see crypto.");
+        for it in &items {
+            if it.label.contains("createHmac") || it.label.contains("createHash") {
+                let (ft, _) = crate::completions::member_filter_label(&path, &it.label);
+                assert!(
+                    ft.starts_with("crypto."),
+                    "Zed filter_text must be crypto.NAME, got {ft}"
+                );
+            }
+        }
+    }
+
+    /// Generic require('fs') — proves no crypto hardcode; any Node module works via @types/node
+    #[tokio::test]
+    async fn real_require_fs_completion() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+
+        let http = "### fs\n{{\n  const fs = require('fs');\n  fs.\n}}\nPOST https://example.com\n";
+        let uri = Url::from_file_path(root.join("_fs_vtsls_test.http")).unwrap();
+        proxy.sync_document(&uri, http).await.expect("sync");
+
+        let shadow = shadow_js_path(&uri).unwrap();
+        let st = fs::read_to_string(&shadow).unwrap();
+        assert!(st.contains("require('fs')"), "shadow missing fs require: {st}");
+        assert!(st.lines().any(|l| l.trim().starts_with("fs.")), "shadow missing fs. line");
+
+        let line = http.lines().position(|l| l.trim().starts_with("fs.")).unwrap() as u32;
+        let col = http.lines().nth(line as usize).unwrap().len() as u32;
+        let pos = Position { line, character: col };
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let res = proxy.completion(&uri, pos, None).await.expect("ok");
+        let items: Vec<CompletionItem> = match res {
+            Some(CompletionResponse::Array(i)) => i,
+            Some(CompletionResponse::List(l)) => l.items,
+            None => vec![],
+        };
+        let labels: Vec<String> = items.iter().map(|x| x.label.clone()).collect();
+        eprintln!("fs. n={} sample={:?}", labels.len(), &labels[..labels.len().min(20)]);
+        assert!(
+            labels.iter().any(|l| l.contains("readFileSync") || l.contains("writeFileSync") || l.contains("existsSync")),
+            "fs. must complete via pure vtsls+@types/node (no hardcode); got {labels:?}"
+        );
+        // Generic filter_text path (not crypto-specific)
+        let (path, _) = crate::completions::dotted_prefix("  fs.").unwrap_or_default();
+        assert_eq!(path, "fs");
+        let (ft, _) = crate::completions::member_filter_label(&path, "readFileSync");
+        assert_eq!(ft, "fs.readFileSync");
+    }
+
+
+}

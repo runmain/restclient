@@ -11,6 +11,10 @@ autoclose_before = ";:.,=}])>"
 # (Zed client-filters on query vs filterText/label).
 word_characters = ["-", "_", "{", "}", "$"]
 # Do NOT add `:` or ` ` — they glue the whole header/URL into the query string.
+# Do NOT add `.` — script member completion (crypto. / fs.) must match JS:
+# after the dot, Zed query is bare member prefix (cre…), not "crypto.cre…".
+# With `.` in the list, query becomes "crypto." and bare vtsls labels
+# (createHmac) are client-filtered out — empty popup while auth-sign.js works.
 # Letters: re-query while typing Host / {{base_url
 completion_query_characters = [
     "-",
@@ -18,7 +22,6 @@ completion_query_characters = [
     "/",
     "{",
     "}",
-    ".",
     "@",
     "$",
     ">",
