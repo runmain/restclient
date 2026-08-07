@@ -39,16 +39,6 @@ else
   C_BG_YEL="" C_BG_RED="" C_BG_CYN=""
 fi
 
-# 高亮「需要注意」一行条幅
-print_attention() {
-  # 用法: print_attention "标题文字"
-  echo ""
-  echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo "${C_BG_YEL}!!  ⚠ 注意：$*${C_RESET}"
-  echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo ""
-}
-
 # 高亮「需要你手动操作」区块
 print_manual_box() {
   local title="$1"
@@ -96,10 +86,9 @@ print_manual_json_block() {
     "command": "$HTTPYAC_PATH",
     // lsp_command: httpyac-lsp 路径 | 一般 ~/.local/bin/httpyac-lsp
     "lsp_command": "$LSP_PATH",
-    // vtsls_command: child vtsls 路径（仅 script 引擎=vtsls 时用）| "vtsls" | which vtsls
+    // vtsls_command: child vtsls 路径（脚本区与官方模型补全）| "vtsls" | which vtsls
     "vtsls_command": "$VTSLS_PATH",
-    // use_builtin_script_completions: true=内置 catalog | false=只用 child vtsls（与 vtsls 互斥）
-    "use_builtin_script_completions": true,
+    // 脚本区统一由 child vtsls 提供官方模型与 Node/JS 补全
     // default_env: 文档/默认名字符串（如 "dev"|"prod"|"test"）；真正发请求以 env JSON 的 activeEnv 为准
     "default_env": "dev"
   },
@@ -113,16 +102,8 @@ print_manual_json_block() {
       },
       "settings": {
         // vtslsCommand: 同 httpyac.vtsls_command（LSP 优先读这里）
-        "vtslsCommand": "$VTSLS_PATH",
-        // vtslsEnabled: true=允许拉起 vtsls | false=强制走 builtin（即使 source 写成 vtsls）
-        "vtslsEnabled": true,
-        // useBuiltinScriptCompletions: true= {{}} 只用内置 catalog | false=只用 child vtsls（互斥，不能两个一起）
-        // 有 vtsls 时默认 false=纯 vtsls（shadow+jsconfig+@types/node）；无 vtsls 时 true
-        "useBuiltinScriptCompletions": false,
-        // scriptCompletionSource: "builtin"|"catalog"|"httpyac" = 内置
-        //                         "vtsls"|"ts"|"typescript" = child vtsls
-        // （与 useBuiltinScriptCompletions 二选一写法，效果相同）
-        "scriptCompletionSource": "vtsls"
+        // 脚本区统一由 child vtsls 提供官方模型与 Node/JS 补全
+        "vtslsCommand": "$VTSLS_PATH"
       }
     }
   },
@@ -147,16 +128,10 @@ EOF
   echo "${C_BG_YEL}<<<<<<<<<<  复制到上一行结束  <<<<<<<<<<${C_RESET}"
   echo ""
   echo "${C_CYN}${C_BOLD}  【配置项可选值速查】${C_RESET}"
-  echo "    ${C_BOLD}script 补全引擎（{{}} 内互斥，只生效一个）${C_RESET}"
-  echo "      useBuiltinScriptCompletions / use_builtin_script_completions"
-  echo "        → ${C_GRN}true${C_RESET}  = 内置 catalog（@returns / .script / require 形状）  ${C_DIM}【默认】${C_RESET}"
-  echo "        → ${C_YEL}false${C_RESET} = child vtsls（需 npm i -g @vtsls/language-server）"
-  echo "      scriptCompletionSource"
-  echo "        → ${C_GRN}\"builtin\"${C_RESET} | \"catalog\" | \"httpyac\"     = 同上内置"
-  echo "        → ${C_YEL}\"vtsls\"${C_RESET}   | \"ts\" | \"typescript\" = 同上 vtsls"
-  echo "      vtslsEnabled"
-  echo "        → ${C_GRN}true${C_RESET}  = 允许启动 vtsls（当 source=vtsls 时）"
-  echo "        → ${C_YEL}false${C_RESET} = 强制 builtin"
+  echo "    ${C_BOLD}script 补全（{{}} 内固定混合）${C_RESET}"
+  echo "      官方 httpyac 全局与 Node/JS 脚本补全由 child vtsls 提供"
+  echo "      vtslsCommand / httpyac.vtsls_command"
+  echo "        → vtsls 绝对路径，或 PATH 中的命令名 ${C_DIM}（脚本补全需要）${C_RESET}"
   echo "    ${C_BOLD}路径类（字符串）${C_RESET}"
   echo "      httpyac.command / lsp_command / vtsls_command / lsp.httpyac-lsp.binary.path"
   echo "        → 绝对路径，或 PATH 中的命令名"
@@ -220,9 +195,6 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "【1/7】编译 httpyac-lsp + httpyac-run（Release）..."
 if (cd lsp && cargo build --release); then
-  mkdir -p target/release
-  cp lsp/target/release/httpyac-lsp target/release/
-  cp lsp/target/release/httpyac-run target/release/
   echo "  ✅ httpyac-lsp 编译成功"
   echo "  ✅ httpyac-run 编译成功（发送/选环境入口）"
   OK_LSP=1
@@ -252,8 +224,7 @@ fi
 WASM_SRC=""
 for candidate in \
   "target/wasm32-wasip2/release/zed_httpyacclient.wasm" \
-  "target/wasm32-wasip2/release/httpyacclient.wasm" \
-  "target/wasm32-wasip1/release/zed_httpyacclient.wasm"
+  "target/wasm32-wasip2/release/httpyacclient.wasm"
 do
   if [[ -f "$candidate" ]]; then
     WASM_SRC="$candidate"
@@ -324,8 +295,11 @@ cp grammars/http.wasm "$INSTALL_DIR/grammars/"
 if [[ -d snippets ]]; then
   cp -R snippets "$INSTALL_DIR/"
 fi
-cp target/release/httpyac-lsp "$INSTALL_DIR/lsp/httpyac-lsp"
-cp target/release/httpyac-run "$INSTALL_DIR/lsp/httpyac-run"
+cp lsp/target/release/httpyac-lsp "$INSTALL_DIR/lsp/httpyac-lsp"
+cp lsp/target/release/httpyac-run "$INSTALL_DIR/lsp/httpyac-run"
+mkdir -p "$INSTALL_DIR/lsp/httpyac-models"
+cp lsp/httpyac-models/httpyac-globals.d.ts "$INSTALL_DIR/lsp/httpyac-models/httpyac-globals.d.ts"
+cp -R lsp/httpyac-models/src "$INSTALL_DIR/lsp/httpyac-models/"
 chmod +x "$INSTALL_DIR/lsp/httpyac-lsp" "$INSTALL_DIR/lsp/httpyac-run"
 
 if [[ "$IS_MACOS" -eq 1 ]]; then
@@ -334,8 +308,11 @@ if [[ "$IS_MACOS" -eq 1 ]]; then
 fi
 
 mkdir -p "$LOCAL_BIN"
-cp target/release/httpyac-lsp "$LOCAL_BIN/httpyac-lsp"
-cp target/release/httpyac-run "$LOCAL_BIN/httpyac-run"
+cp lsp/target/release/httpyac-lsp "$LOCAL_BIN/httpyac-lsp"
+cp lsp/target/release/httpyac-run "$LOCAL_BIN/httpyac-run"
+mkdir -p "$LOCAL_BIN/httpyac-models"
+cp lsp/httpyac-models/httpyac-globals.d.ts "$LOCAL_BIN/httpyac-models/httpyac-globals.d.ts"
+cp -R lsp/httpyac-models/src "$LOCAL_BIN/httpyac-models/"
 chmod +x "$LOCAL_BIN/httpyac-lsp" "$LOCAL_BIN/httpyac-run"
 if [[ "$IS_MACOS" -eq 1 ]]; then
   codesign --force --sign - "$LOCAL_BIN/httpyac-lsp" 2>/dev/null || true
@@ -411,10 +388,9 @@ if [[ -z "$VTSLS_PATH" ]]; then
 fi
 if [[ -z "$VTSLS_PATH" ]]; then
   VTSLS_PATH="vtsls"
-  print_manual_box "安装 vtsls（仅当 script 引擎选 vtsls 时需要）" \
+  print_manual_box "安装 vtsls（脚本区 Node/JS 混合补全推荐）" \
     "原因：当前 PATH 中找不到 vtsls（@vtsls/language-server）" \
-    "说明：默认 useBuiltinScriptCompletions=true 用内置 catalog，可不装 vtsls" \
-    "      若要用 child vtsls：useBuiltinScriptCompletions=false 或 scriptCompletionSource=\"vtsls\"" \
+    "说明：脚本区官方 httpyac 全局、request/response 和 crypto/Node 均由 vtsls 提供" \
     "" \
     "请执行：" \
     "  npm install -g @vtsls/language-server" \
@@ -422,13 +398,10 @@ if [[ -z "$VTSLS_PATH" ]]; then
     "然后验证：" \
     "  which vtsls && vtsls --version" \
     "" \
-    "装好后写入 settings（注释=可选值）：" \
-    "  \"vtslsCommand\": \"\$(which vtsls)\"   // 路径字符串" \
-    "  \"useBuiltinScriptCompletions\": false // true=内置 | false=vtsls（互斥）" \
-    "  \"scriptCompletionSource\": \"vtsls\"  // \"builtin\"|\"catalog\"|\"httpyac\" | \"vtsls\"|\"ts\"" \
-    "  \"vtslsEnabled\": true                 // true=允许 vtsls | false=强制 builtin"
-  WARNINGS+=("未找到 vtsls — 保持 useBuiltinScriptCompletions=true 即可用内置 catalog")
-  MANUAL_OPTIONAL+=("可选：npm i -g @vtsls/language-server，再设 useBuiltinScriptCompletions=false 用 vtsls")
+    "装好后写入 settings：" \
+    "  \"vtslsCommand\": \"\$(which vtsls)\"   // 路径字符串（有则自动混合 Node/JS 补全）"
+  WARNINGS+=("未找到 vtsls — 脚本区官方模型和 Node/JS 补全不可用")
+  MANUAL_OPTIONAL+=("安装：npm i -g @vtsls/language-server，启用脚本区官方模型和 Node/JS 补全")
 else
   echo "  ✅ vtsls      = $VTSLS_PATH"
   OK_VTSLS=1
@@ -482,7 +455,6 @@ else
       FORCE_ZED_SETTINGS="${FORCE_ZED_SETTINGS:-0}" \
       python3 - "$ZED_SETTINGS" <<'PY'
 import json, os, re, shutil, sys, time
-from copy import deepcopy
 
 path = sys.argv[1]
 httpyac = os.environ.get("HTTPYAC_PATH", "httpyac")
@@ -513,7 +485,6 @@ if existed:
 else:
     settings = {}
 
-before = deepcopy(settings)
 changed = []
 
 def setp(keys, value, *, force_update=False):
@@ -541,12 +512,20 @@ setp(["httpyac", "default_env"], "dev", force_update=False)
 setp(["lsp", "httpyac-lsp", "binary", "path"], lsp, force_update=True)
 setp(["lsp", "httpyac-lsp", "binary", "arguments"], [], force_update=False)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsCommand"], vtsls, force_update=True)
-setp(["lsp", "httpyac-lsp", "settings", "vtslsEnabled"], True, force_update=False)
-# Script tips: builtin XOR vtsls — pure vtsls when binary found (shadow+jsconfig+@types/node)
-_use_vtsls = (ok_vtsls == 1)
-setp(["lsp", "httpyac-lsp", "settings", "useBuiltinScriptCompletions"], (not _use_vtsls), force_update=True)
-setp(["lsp", "httpyac-lsp", "settings", "scriptCompletionSource"], ("vtsls" if _use_vtsls else "builtin"), force_update=True)
-setp(["httpyac", "use_builtin_script_completions"], True, force_update=False)
+# Drop removed engine-toggle keys from older installs (always mixed now)
+for _dead in (
+    "useBuiltinScriptCompletions",
+    "scriptCompletionSource",
+    "use_builtin_script_completions",
+    "script_completion_source",
+    "vtslsEnabled",
+    "vtsls_enabled",
+):
+    try:
+        settings.get("lsp", {}).get("httpyac-lsp", {}).get("settings", {}).pop(_dead, None)
+        settings.get("httpyac", {}).pop(_dead, None)
+    except Exception:
+        pass
 
 if not changed:
     print("UP_TO_DATE")

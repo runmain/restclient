@@ -126,11 +126,23 @@ impl zed::Extension for HttpyacClientExtension {
         worktree: &zed::Worktree,
     ) -> Result<Option<serde_json::Value>> {
         let mut map = serde_json::Map::new();
-        // Seed vtsls path for script-region proxy
+        // Forward user lsp.httpyac-lsp.settings + seed vtsls path for mixed completions
         if let Ok(settings) = LspSettings::for_worktree(language_server_id.as_ref(), worktree) {
             if let Some(s) = settings.settings {
                 if let Some(obj) = s.as_object() {
                     for (k, v) in obj {
+                        // Drop removed exclusive-engine keys if present in old settings
+                        if matches!(
+                            k.as_str(),
+                            "useBuiltinScriptCompletions"
+                                | "use_builtin_script_completions"
+                                | "scriptCompletionSource"
+                                | "script_completion_source"
+                                | "vtslsEnabled"
+                                | "vtsls_enabled"
+                        ) {
+                            continue;
+                        }
                         map.insert(k.clone(), v.clone());
                     }
                 }
@@ -139,46 +151,6 @@ impl zed::Extension for HttpyacClientExtension {
         if !map.contains_key("vtslsCommand") && !map.contains_key("vtsls_command") {
             if let Some(v) = worktree.which("vtsls") {
                 map.insert("vtslsCommand".into(), serde_json::Value::String(v));
-            }
-        }
-        if !map.contains_key("vtslsEnabled") {
-            map.insert("vtslsEnabled".into(), serde_json::Value::Bool(true));
-        }
-        // Default to pure vtsls (user request) when vtsls available; otherwise safe builtin
-        if !map.contains_key("useBuiltinScriptCompletions")
-            && !map.contains_key("scriptCompletionSource")
-            && map.contains_key("vtslsCommand")
-        {
-            map.insert(
-                "useBuiltinScriptCompletions".into(),
-                serde_json::Value::Bool(false),
-            );
-            map.insert(
-                "scriptCompletionSource".into(),
-                serde_json::Value::String("vtsls".into()),
-            );
-        } else if !map.contains_key("useBuiltinScriptCompletions")
-            && !map.contains_key("scriptCompletionSource")
-        {
-            // Force vtsls when available (pure vtsls path)
-            if map.contains_key("vtslsCommand") && map.get("vtslsCommand").unwrap().as_str().is_some_and(|s| !s.is_empty()) {
-                map.insert(
-                    "useBuiltinScriptCompletions".into(),
-                    serde_json::Value::Bool(false),
-                );
-                map.insert(
-                    "scriptCompletionSource".into(),
-                    serde_json::Value::String("vtsls".into()),
-                );
-            } else {
-                map.insert(
-                    "useBuiltinScriptCompletions".into(),
-                    serde_json::Value::Bool(true),
-                );
-                map.insert(
-                    "scriptCompletionSource".into(),
-                    serde_json::Value::String("builtin".into()),
-                );
             }
         }
         if map.is_empty() {

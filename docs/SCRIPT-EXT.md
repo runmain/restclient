@@ -1,17 +1,24 @@
-# `.script/` — builtin + user JS modules for completions
+# Script completions — httpyac model snapshot + vtsls
 
-httpyac-lsp loads **two layers** of JS modules (same parse rules):
+Script islands use **child vtsls** as the single completion engine:
 
-| Layer | Location | Role |
-|-------|----------|------|
-| **1. Builtin** | `lsp/builtin_script/*.js` (embedded in the binary) | `request` / `response` / `client` / `console` / `crypto` / … |
-| **2. User** | project `.script/*.js` (next to `.http` or any parent) | extras + **overrides** |
+| Layer | Source | Role |
+|-------|--------|------|
+| **1. Official model source** | `lsp/httpyac-models/src/models` snapshot + `httpyac-globals.d.ts` | vtsls 的 11 个全局变量和递归类型依赖 |
+| **2. Child vtsls** | `@vtsls/language-server` | 官方模型成员、Node/JS/TS、用户模块和 `require()` |
 
-**User wins** on the same module path and member name.
+The adjacent `lsp/httpyac-models` directory is a manual snapshot of the current
+httpyac model source. Replace that directory manually when upstream types change;
+the thin ambient wrapper only binds the 11 official global names. Rust no longer
+injects official script globals or `request/response` members; if vtsls is unavailable,
+only HTTP and mustache completion remains available.
 
-## `require('./….js')` — load into the completion engine
+Settings: only `vtslsCommand` / `httpyac.vtsls_command` (path to child vtsls).
 
-Relative requires in `{{ }}` / script blocks are **parsed for tips** (editor-only):
+## `require('./….js')` — handled by vtsls
+
+Relative requires in `{{ }}` / script blocks are sent to child vtsls for JavaScript
+and TypeScript completion. `httpyac-lsp` does not locally parse these modules:
 
 ```http
 {{
@@ -23,9 +30,15 @@ Relative requires in `{{ }}` / script blocks are **parsed for tips** (editor-onl
 }}
 ```
 
-Resolution is relative to the **`.http` file’s directory**. Files larger than 512KiB are skipped. Builtin / `.script/` catalogs still apply; required files merge on top by stem name.
+Resolution and module/type analysis are owned by vtsls. Runtime execution remains
+owned by the external httpyac CLI.
 
-## Shape chaining (general rule, not special cases)
+## Shape chaining
+
+Shape inference for user functions, modules, `require()` aliases, official httpyac
+models and Node APIs is provided by vtsls.
+
+<!-- Historical local-parser details are intentionally retained below for reference. -->
 
 **Phenomenon:** if a binding’s right-hand side has a *shape*, then `name.` offers that
 shape’s members — **any** function/variable names, not only demos like `signRequest`.
@@ -117,57 +130,49 @@ module.exports = {
 ## Layout
 
 ```text
-# shipped with httpyac-lsp (not in your repo):
-lsp/builtin_script/
-  request.js
-  response.js      # includes response.headers.get / valueOf
-  client.js        # includes client.global.set / get / …
-  console.js
-  crypto.js
-  …
+# shipped with httpyac-lsp:
+lsp/httpyac-models/src/models/       → official upstream model snapshot
+lsp/httpyac-models/httpyac-globals.d.ts → 11 ambient global bindings
 
-# your project:
+# your project (user modules are analyzed by vtsls):
 your-project/
   api.http
   .script/
-    crypto.js              → overrides/extends builtin crypto.
-    helpers.js             → new root helpers.
-    request.headers.js     → path request.headers. (e.g. add .set)
+    helpers.js             → new root helpers
+    request.headers.js     → path request.headers. (e.g. add helpers)
 ```
+
+Node modules such as `crypto` are **not** catalogued here — child **vtsls** covers them in mixed mode.
 
 - **Any filename** works; stem = module root. Dotted stems (`request.headers.js`)
   are **path extensions**.
 - Nested `module.exports = { a: { b(){} } }` → `a.b` completions.
 
-## What is parsed
+## Non-script completion scope
 
 | Pattern | Result |
 |---------|--------|
-| `function name() {}` | `name` |
-| `const name = () => {}` | `name` |
-| `exports.name = …` / `module.exports.name = …` | `name` |
-| `module.exports = { a, b: { c(){} } }` | `a`, `b`, `b.c` |
-| `class X { method() {} }` | `method` (and related) |
-| `/** @httpyac-path request.headers */` | attach file exports to that path |
+| HTTP/环境变量 | HTTP 请求、Header、`{{var}}` 和环境变量 |
+| `SCRIPT_SNIPPETS` | 编辑器脚本模板提示 |
 
-Comments are stripped for structure parsing; `@httpyac-path` is read from the
-original source.
+用户 JavaScript/TypeScript、11 个官方全局变量、类型推断和模块路径均由 child vtsls
+负责，不再由 httpyac-lsp 的 Rust catalog 负责。
 
-## `require()` binding aliases
+## `require()` binding aliases (vtsls)
 
 ```js
 const c = require('crypto');
-// c.  → same member table as crypto. (builtin node:crypto + .script/crypto.js)
+// c.  → vtsls 提供 Node crypto 类型
 ```
 
 Also:
 
 ```js
 const h = require('./.script/helpers');
-// h.  → members parsed from helpers.js
+// h.  → vtsls 提供 helpers.js 的成员和类型
 ```
 
-## Path extensions (e.g. `request.headers.set`)
+## Path extensions (vtsls)
 
 **Option A — dotted filename**
 
@@ -182,7 +187,7 @@ module.exports = {
 };
 ```
 
-Typing `request.headers.` suggests `set` / `get`.
+用户模块路径和 httpyac 官方 `request.*` 均由 vtsls 解析。
 
 **Option B — JSDoc tag in any file**
 
@@ -226,7 +231,8 @@ or `request.headers.` (with HTTP language server = **httpyac-lsp only**).
 
 | Layer | Role |
 |-------|------|
-| **httpyac-lsp** | Parses `.script/*.js` for **completions only** |
+| **httpyac-lsp** | Supplies the 11 official httpyac roots and official request/response members |
+| **child vtsls** | Parses `.http` script islands, `.script/*.js`, `require()` and Node/TS types |
 | **httpyac CLI** | Actually runs scripts; `require()` must resolve at runtime |
 
 If you `require('./.script/crypto.js')` from a pre-request script, httpyac’s
@@ -234,6 +240,7 @@ Node/VM must be able to load that path (same as any other relative require).
 
 ## Limits
 
-- Heuristic parser (not full ES/TS AST): unusual syntax may be missed.
-- Not a substitute for **vtsls** on real `.js` buffers (see [VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)).
-- Re-reads `.script/` when file mtimes change (cached per LSP process).
+- vtsls/Node availability controls user-module and Node/TS completion quality.
+- The official httpyac table is intentionally limited to the documented 11 roots
+  and their request/response members.
+- Runtime `require()` resolution still belongs to the external httpyac CLI.

@@ -91,37 +91,52 @@ impl VariableResolver {
     /// merging every `http-client.env.json` / private file found. Closer directories win
     /// on key conflicts (loaded last).
     pub fn load_environments_from_dir(&mut self, start_dir: &Path) -> bool {
+        self.load_environments_from_dir_with_errors(start_dir).0
+    }
+
+    /// Load environments and return non-fatal file errors for callers that
+    /// need to surface diagnostics before delegating execution to httpyac.
+    pub fn load_environments_from_dir_with_errors(
+        &mut self,
+        start_dir: &Path,
+    ) -> (bool, Vec<String>) {
         let dirs = find_all_env_dirs_walking_up(start_dir);
         if dirs.is_empty() {
-            return false;
+            return (false, Vec::new());
         }
 
+        let mut errors = Vec::new();
         // Load from root → leaf so nearer files override
         for search_dir in dirs.iter().rev() {
             let public_file = search_dir.join(ENV_FILE_PUBLIC);
             if public_file.exists() {
-                let _ = self.merge_environments_file(&public_file);
+                if let Err(e) = self.merge_environments_file(&public_file) {
+                    errors.push(format!("{}: {e}", public_file.display()));
+                }
             }
 
             let private_file = search_dir.join(ENV_FILE_PRIVATE);
             if private_file.exists() {
-                if let Ok(private_envs) = Self::read_environments(&private_file) {
-                    for (env_name, private_env) in private_envs {
-                        let entry =
-                            self.environments
-                                .entry(env_name)
-                                .or_insert_with(|| Environment {
-                                    variables: HashMap::new(),
-                                });
-                        for (key, value) in private_env.variables {
-                            entry.variables.insert(key, value);
+                match Self::read_environments(&private_file) {
+                    Ok(private_envs) => {
+                        for (env_name, private_env) in private_envs {
+                            let entry =
+                                self.environments
+                                    .entry(env_name)
+                                    .or_insert_with(|| Environment {
+                                        variables: HashMap::new(),
+                                    });
+                            for (key, value) in private_env.variables {
+                                entry.variables.insert(key, value);
+                            }
                         }
                     }
+                    Err(e) => errors.push(format!("{}: {e}", private_file.display())),
                 }
             }
         }
 
-        !self.environments.is_empty()
+        (!self.environments.is_empty(), errors)
     }
 
     /// Merge env definitions from a JSON file without wiping existing envs.

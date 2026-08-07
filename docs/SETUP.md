@@ -150,7 +150,7 @@ Runtime of scripts is always **httpyac CLI**.
 | LSP not running | `ls ~/.local/bin/httpyac-lsp`; Server Logs → HTTPyac LSP |
 | No full `crypto.` in `.http` script | `npm i -g @vtsls/language-server`, set `httpyac.vtsls_command` / re-run `./install_to_zed.sh`; or move logic to `.js` ([VTSLS-SCRIPTS.md](./VTSLS-SCRIPTS.md)) / `.script` ([SCRIPT-EXT.md](./SCRIPT-EXT.md)) |
 | Custom `request.headers.set` / own helpers | Add any `.js` under `.script/` (nested exports + `@httpyac-path`) — [SCRIPT-EXT.md](./SCRIPT-EXT.md) |
-| `const c = require('crypto'); c.` empty | Ensure vtsls installed + `vtslsEnabled`; check Server Logs for “script-region vtsls ready” |
+| `const c = require('crypto'); c.` empty | Install vtsls (`npm i -g @vtsls/language-server`), set `vtslsCommand` / re-run install; check Server Logs for “script-region vtsls ready” |
 | vtsls errors on `.http` | Remove **Zed** `vtsls` from `languages.HTTP.language_servers` (keep only `httpyac-lsp`; child vtsls is separate) |
 
 See also [README.md](../README.md).

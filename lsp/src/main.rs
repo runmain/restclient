@@ -1,25 +1,20 @@
 use httpyac_lsp::completions::{
-    byte_to_lsp_utf16, crypto_digest_encoding_partial, crypto_hash_chain_filter, dotted_prefix,
-    header_values, in_script_context, lsp_utf16_to_byte, member_filter_label,
-    member_replace_start_byte, AUTH_SCHEMES, BUILTIN_VARS, CRYPTO_CREATE_HASH_SNIPPET,
-    CRYPTO_CREATE_HMAC_SNIPPET, CRYPTO_DIGEST_ENCODINGS, CRYPTO_HASH_CHAIN_PROPS,
-    CRYPTO_UPDATE_THEN_DIGEST_SNIPPET, HEADER_NAMES, HTTP_METHODS, META_DIRECTIVES,
-    REQUIRE_MODULES, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
+    byte_to_lsp_utf16, dotted_prefix, header_values, in_script_context, lsp_utf16_to_byte,
+    member_filter_label, member_replace_start_byte, AUTH_SCHEMES, BUILTIN_VARS, HEADER_NAMES,
+    HTTP_METHODS, META_DIRECTIVES, SCRIPT_ROOTS, SCRIPT_SNIPPETS,
 };
 use httpyac_lsp::parser::{parse_http_file, HttpRequest};
 use httpyac_lsp::script_ext::{
-    enrich_catalog_from_requires, ensure_shape_type, infer_expr_type, ingest_script_locals,
-    parse_typed_bindings, resolve_completion_path, resolve_path_with_bindings, script_window_text,
-    PathResolve, ScriptCatalog, ScriptCatalogCache, ScriptMember,
+    ensure_shape_type, infer_expr_type, load_builtin_catalog, resolve_completion_path, PathResolve,
+    ScriptMember,
 };
 use httpyac_lsp::variables::VariableResolver;
-use httpyac_lsp::vtsls_proxy::{ScriptCompletionSource, VtslsBridge};
+use httpyac_lsp::vtsls_proxy::VtslsBridge;
 use httpyac_lsp::{collect_env_names, resolve_httpyac_bin};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -69,8 +64,6 @@ struct Document {
 struct HttpLsp {
     client: Client,
     documents: Arc<RwLock<HashMap<Url, Document>>>,
-    /// Cached parse of nearest `.script/*.js` (any files the user adds).
-    script_catalog: Arc<Mutex<ScriptCatalogCache>>,
     /// Optional child vtsls for full TS IntelliSense inside script regions.
     vtsls: Arc<VtslsBridge>,
 }
@@ -80,7 +73,6 @@ impl HttpLsp {
         HttpLsp {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
-            script_catalog: Arc::new(Mutex::new(ScriptCatalogCache::default())),
             vtsls: Arc::new(VtslsBridge::new()),
         }
     }
@@ -94,28 +86,6 @@ impl HttpLsp {
     async fn ensure_vtsls(&self, uri: &Url) {
         let root = Self::workspace_root_for(uri);
         self.vtsls.ensure_started(&self.client, root).await;
-    }
-
-    /// Builtin + user `.script/` catalog for this HTTP file’s directory.
-    /// Always available (builtins embedded even without a user `.script/`).
-    /// Never panics: on failure falls back to builtin-only catalog.
-    async fn catalog_for_uri(&self, uri: &Url) -> ScriptCatalog {
-        let dir = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut cache = self.script_catalog.lock().await;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cache.get_or_load(&dir).clone()
-        })) {
-            Ok(cat) => cat,
-            Err(_) => {
-                // Reset poisoned-ish cache state by replacing catalog
-                *cache = ScriptCatalogCache::default();
-                httpyac_lsp::script_ext::load_builtin_catalog()
-            }
-        }
     }
 
     /// Load env vars for `{{…}}` completion from http-client.env.json (all envs).
@@ -354,29 +324,6 @@ fn mustache_closing_extra(after: &str) -> u32 {
     }
 }
 
-/// If cursor is inside `require('…` or `require("…`, return the partial module name.
-fn require_module_partial(before: &str) -> Option<String> {
-    let lower = before.to_ascii_lowercase();
-    let idx = lower.rfind("require(")?;
-    let after = &before[idx + "require(".len()..];
-    let after = after.trim_start();
-    let (quote, rest) = if let Some(r) = after.strip_prefix('\'') {
-        ('\'', r)
-    } else if let Some(r) = after.strip_prefix('"') {
-        ('"', r)
-    } else {
-        return None;
-    };
-    if rest.contains(quote) {
-        return None; // already closed
-    }
-    let partial: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '/' || *c == '.')
-        .collect();
-    Some(partial)
-}
-
 fn resolve_runner_bin() -> String {
     if let Ok(p) = std::env::var("HTTPYAC_RUN_BIN") {
         if !p.is_empty() {
@@ -492,21 +439,6 @@ impl LanguageServer for HttpLsp {
                 if let Some(c) = h.get("vtsls_command").or_else(|| h.get("vtslsCommand")) {
                     mapped.insert("vtslsCommand".into(), c.clone());
                 }
-                if let Some(e) = h.get("vtsls_enabled").or_else(|| h.get("vtslsEnabled")) {
-                    mapped.insert("vtslsEnabled".into(), e.clone());
-                }
-                if let Some(b) = h
-                    .get("use_builtin_script_completions")
-                    .or_else(|| h.get("useBuiltinScriptCompletions"))
-                {
-                    mapped.insert("useBuiltinScriptCompletions".into(), b.clone());
-                }
-                if let Some(s) = h
-                    .get("script_completion_source")
-                    .or_else(|| h.get("scriptCompletionSource"))
-                {
-                    mapped.insert("scriptCompletionSource".into(), s.clone());
-                }
                 if !mapped.is_empty() {
                     self.vtsls
                         .apply_settings_json(&serde_json::Value::Object(mapped))
@@ -525,7 +457,7 @@ impl LanguageServer for HttpLsp {
 
         let requests = parse_http_file(&content).unwrap_or_default();
         // Only spin vtsls when script engine is vtsls
-        if self.vtsls.script_source().await == ScriptCompletionSource::Vtsls {
+        if true { // vtsls always on
             self.ensure_vtsls(&uri).await;
             self.vtsls.sync(&uri, &content).await;
         }
@@ -544,7 +476,7 @@ impl LanguageServer for HttpLsp {
 
         if let Some(change) = params.content_changes.into_iter().last() {
             let requests = parse_http_file(&change.text).unwrap_or_default();
-            if self.vtsls.script_source().await == ScriptCompletionSource::Vtsls {
+            if true { // vtsls always on
                 self.ensure_vtsls(&uri).await;
                 self.vtsls.sync(&uri, &change.text).await;
             }
@@ -643,7 +575,7 @@ impl LanguageServer for HttpLsp {
 
     async fn completion_resolve(&self, params: CompletionItem) -> Result<CompletionItem> {
         // Only resolve via child vtsls when script engine is vtsls.
-        if self.vtsls.script_source().await != ScriptCompletionSource::Vtsls {
+        if false { // vtsls always on
             return Ok(params);
         }
         let proxy = self.vtsls.proxy.lock().await;
@@ -683,7 +615,7 @@ impl LanguageServer for HttpLsp {
             return Ok(None);
         }
         // Hover from vtsls only when script engine is vtsls (mutex with catalog).
-        if self.vtsls.script_source().await != ScriptCompletionSource::Vtsls {
+        if false { // vtsls always on
             return Ok(None);
         }
         self.ensure_vtsls(uri).await;
@@ -724,7 +656,7 @@ impl LanguageServer for HttpLsp {
         if !script_ctx {
             return Ok(None);
         }
-        if self.vtsls.script_source().await != ScriptCompletionSource::Vtsls {
+        if false { // vtsls always on
             return Ok(None);
         }
         self.ensure_vtsls(uri).await;
@@ -771,34 +703,7 @@ impl HttpLsp {
             return Ok(None);
         }
 
-        let catalog = self.catalog_for_uri(&uri).await;
         let env_vars = Self::load_env_vars_for_completion(&uri);
-        let http_dir = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        // Catalog: Host / {{var}} / and script tips when engine = builtin.
-        let catalog_resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            completion_sync(&content, position, &catalog, &env_vars, &http_dir)
-        })) {
-            Ok(r) => r,
-            Err(payload) => {
-                let msg = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic".into());
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("httpyac-lsp completion panic (catalog): {msg}"),
-                    )
-                    .await;
-                None
-            }
-        };
 
         let lines: Vec<&str> = content.split('\n').collect();
         let line_idx = position.line as usize;
@@ -811,137 +716,199 @@ impl HttpLsp {
             false
         };
 
+        // HTTP/mustache completion remains local; script islands are owned by vtsls.
+        let catalog_resp = if in_script {
+            None
+        } else {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                completion_sync(&content, position, &env_vars)
+            })) {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic".into());
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("httpyac-lsp completion panic (catalog): {msg}"),
+                        )
+                        .await;
+                    None
+                }
+            }
+        };
+
         // Non-script (HTTP lines, mustache vars, …): always catalog only.
         if !in_script {
             return Ok(catalog_resp);
         }
 
-        // Script islands: **mutually exclusive** engine (settings).
-        //   useBuiltinScriptCompletions: true  → builtin catalog only
-        //   useBuiltinScriptCompletions: false → child vtsls only
-        let source = self.vtsls.script_source().await;
+        // Script islands: child vtsls owns the official httpyac models and JS/Node.
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "httpyac-lsp completion: in_script={in_script} source={:?} line={} col={}",
-                    source.as_str(),
+                    "httpyac-lsp completion: in_script={in_script} vtsls line={} col={}",
                     position.line,
                     position.character
                 ),
             )
             .await;
-        match source {
-            ScriptCompletionSource::Builtin => Ok(catalog_resp),
-            ScriptCompletionSource::Vtsls => {
-                self.ensure_vtsls(&uri).await;
-                self.vtsls.sync(&uri, &content).await;
-                let vtsls_items = {
-                    let proxy = self.vtsls.proxy.lock().await;
-                    if let Some(p) = proxy.as_ref() {
-                        match p
-                            .completion(&uri, position, params.context.clone())
-                            .await
-                        {
-                            Ok(Some(CompletionResponse::Array(items))) => items,
-                            Ok(Some(CompletionResponse::List(list))) => list.items,
-                            Ok(None) => Vec::new(),
-                            Err(e) => {
-                                self.client
-                                    .log_message(
-                                        MessageType::WARNING,
-                                        format!("vtsls completion: {e}"),
-                                    )
-                                    .await;
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                "vtsls proxy not started (check vtslsCommand / PATH)",
-                            )
-                            .await;
-                        Vec::new()
-                    }
-                };
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("httpyac-lsp vtsls items={}", vtsls_items.len()),
-                    )
-                    .await;
-                if vtsls_items.is_empty() {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            "vtsls returned 0 completion items (check shadow *.__vtsls__.js + jsconfig)",
-                        )
-                        .await;
-                    // Still empty — do not silently switch engines; user chose vtsls.
-                    return Ok(None);
+        let vtsls_on = true; // always on
+
+        let mut catalog_items: Vec<CompletionItem> = match catalog_resp {
+            Some(CompletionResponse::Array(items)) => items,
+            Some(CompletionResponse::List(list)) => list.items,
+            None => Vec::new(),
+        };
+        // Prefer official httpyac tips when ranking
+        for it in &mut catalog_items {
+            let prefix = "0httpyac-";
+            it.sort_text = Some(format!(
+                "{}{}",
+                prefix,
+                it.sort_text.clone().unwrap_or_else(|| it.label.clone())
+            ));
+            if let Some(d) = it.detail.as_mut() {
+                if !d.contains("[httpyac]") {
+                    *d = format!("[httpyac] {d}");
                 }
-                // ── Zed client-side filter: query is often `crypto.` / `request.st`
-                // Catalog sets filter_text = "path.name" so fuzzy match works.
-                // Raw vtsls items only have label "createHmac" → Zed drops them all.
-                let mut vtsls_items = vtsls_items;
-                {
-                    let lines: Vec<&str> = content.split('\n').collect();
-                    let line_idx = position.line as usize;
-                    let before = if line_idx < lines.len() {
-                        let line = lines[line_idx];
-                        let col = lsp_utf16_to_byte(line, position.character);
-                        &line[..col.min(line.len())]
-                    } else {
-                        ""
-                    };
-                    // path like "crypto", filter like "" or "cre"
-                    let (path, partial) = dotted_prefix(before)
-                        .or_else(|| {
-                            let t = before.trim_end();
-                            if t.ends_with('.') {
-                                let p = t.trim_end_matches('.').rsplit(|c: char| {
-                                    !c.is_ascii_alphanumeric() && c != '_' && c != '$'
-                                }).next().unwrap_or("").to_string();
-                                Some((p, String::new()))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    for it in &mut vtsls_items {
-                        // Keep insert label as bare member name for clean insert
-                        let name = it.label.clone();
-                        if !path.is_empty() {
-                            let (ft, lab) = member_filter_label(&path, &name);
-                            // label stays short for UI; filter_text carries path for Zed query
-                            it.filter_text = Some(ft);
-                            // Also put path.name into label_details description so ranking works
-                            if it.label_details.is_none() {
-                                it.label_details = Some(CompletionItemLabelDetails {
-                                    detail: None,
-                                    description: Some(lab),
-                                });
-                            }
-                        } else if !partial.is_empty() {
-                            // bare ident: signRe → ensure filter includes partial
-                            if it.filter_text.as_ref().map(|s| !s.contains(&partial)).unwrap_or(true) {
-                                it.filter_text = Some(format!("{} {}", name, partial));
-                            }
-                        }
-                        if it.sort_text.is_none() {
-                            it.sort_text = Some(format!("0{name}"));
-                        }
-                    }
-                    let _ = partial;
-                }
-                Ok(Some(CompletionResponse::List(CompletionList {
-                    is_incomplete: true,
-                    items: vtsls_items,
-                })))
+            } else {
+                it.detail = Some("[httpyac] official".into());
             }
         }
+
+        let mut vtsls_items: Vec<CompletionItem> = Vec::new();
+        if vtsls_on {
+            self.ensure_vtsls(&uri).await;
+            self.vtsls.sync(&uri, &content).await;
+            vtsls_items = {
+                let mut proxy = self.vtsls.proxy.lock().await;
+                if let Some(p) = proxy.as_ref() {
+                    match p
+                        .completion(&uri, position, params.context.clone())
+                        .await
+                    {
+                        Ok(Some(CompletionResponse::Array(items))) => items,
+                        Ok(Some(CompletionResponse::List(list))) => list.items,
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            *proxy = None;
+                            self.client
+                                .log_message(
+                                    MessageType::WARNING,
+                                    format!("vtsls completion: {e}"),
+                                )
+                                .await;
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "httpyac-lsp mixed: catalog={} vtsls={}",
+                        catalog_items.len(),
+                        vtsls_items.len()
+                    ),
+                )
+                .await;
+
+            // Zed client-side filter: query is often `crypto.` / `request.st`
+            let lines: Vec<&str> = content.split('\n').collect();
+            let line_idx = position.line as usize;
+            let before = if line_idx < lines.len() {
+                let line = lines[line_idx];
+                let col = lsp_utf16_to_byte(line, position.character);
+                &line[..col.min(line.len())]
+            } else {
+                ""
+            };
+            let (path, partial) = dotted_prefix(before)
+                .or_else(|| {
+                    let t = before.trim_end();
+                    if t.ends_with('.') {
+                        let p = t
+                            .trim_end_matches('.')
+                            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        Some((p, String::new()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            // vtsls owns script globals and their member trees. Keep its
+            // results for both official httpyac roots and Node/JS/TS paths.
+            for it in &mut vtsls_items {
+                let name = it.label.clone();
+                if !path.is_empty() {
+                    let (ft, lab) = member_filter_label(&path, &name);
+                    it.filter_text = Some(ft);
+                    if it.label_details.is_none() {
+                        it.label_details = Some(CompletionItemLabelDetails {
+                            detail: None,
+                            description: Some(lab),
+                        });
+                    }
+                } else if !partial.is_empty() {
+                    if it
+                        .filter_text
+                        .as_ref()
+                        .map(|s| !s.contains(&partial))
+                        .unwrap_or(true)
+                    {
+                        it.filter_text = Some(format!("{} {}", name, partial));
+                    }
+                }
+                it.sort_text = Some(format!(
+                    "1vtsls-{}",
+                    it.sort_text.clone().unwrap_or_else(|| name.clone())
+                ));
+                if let Some(d) = it.detail.as_mut() {
+                    if !d.contains("[vtsls]") {
+                        *d = format!("[vtsls] {d}");
+                    }
+                } else {
+                    it.detail = Some("[vtsls]".into());
+                }
+            }
+            let _ = partial;
+
+        }
+
+        // Script items come only from vtsls; HTTP/mustache items were handled above.
+        let mut best: std::collections::HashMap<String, CompletionItem> =
+            std::collections::HashMap::new();
+        for it in catalog_items {
+            best.insert(it.label.clone(), it);
+        }
+        for it in vtsls_items {
+            best.insert(it.label.clone(), it);
+        }
+        let mut items: Vec<_> = best.into_values().collect();
+        items.sort_by(|a, b| {
+            a.sort_text
+                .as_ref()
+                .unwrap_or(&a.label)
+                .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+        });
+        if items.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items,
+        })))
     }
 }
 
@@ -949,9 +916,7 @@ impl HttpLsp {
 fn completion_sync(
     content: &str,
     position: Position,
-    script_catalog: &ScriptCatalog,
     env_vars: &[(String, String, String)],
-    http_file_dir: &std::path::Path,
 ) -> Option<CompletionResponse> {
         let lines: Vec<&str> = content.split('\n').collect();
 
@@ -1200,212 +1165,20 @@ fn completion_sync(
         let script_ctx = in_script_context(&lines, line_idx, before_cursor);
 
         // --- httpyac / JS script: response. client. crypto. require( … ---
-        // Catalog path (vtsls is attempted asynchronously in completion_inner first).
+        // Keep only the official httpyac catalog here. Node/JS/TS and user modules
+        // are provided by child vtsls in completion_inner.
         if script_ctx {
-            let script_text = script_window_text(&lines, line_idx);
-            // Pull require('./….js') + local functions/returns in this {{ }} window.
-            let mut script_catalog = script_catalog.clone();
-            ingest_script_locals(&mut script_catalog, &script_text);
-            let require_bindings = enrich_catalog_from_requires(
-                &mut script_catalog,
-                http_file_dir,
-                &script_text,
-            );
-            let var_types =
-                parse_typed_bindings(&script_text, &mut script_catalog, &require_bindings);
+            let mut script_catalog = load_builtin_catalog();
+            let require_bindings: Vec<httpyac_lsp::script_ext::RequireBinding> = Vec::new();
+            let var_types: HashMap<String, String> = HashMap::new();
 
-            // crypto fluent chain: createHmac/Hash → .update → .digest('base64')
-            // Also multi-line: createHmac(...)\n  .|
-            // ── Unified member completions (request/response/client/console/crypto/…) ──
-            // One rule for all: label+filter_text = "path.name" (single line, no \n).
-            // Zed query is typically "request." / "response.st" / "crypto." — must be a prefix.
-
-            if let Some(enc_partial) = crypto_digest_encoding_partial(before_cursor) {
-                let el = enc_partial.to_lowercase();
-                for enc in CRYPTO_DIGEST_ENCODINGS {
-                    if el.is_empty() || enc.starts_with(el.as_str()) {
-                        items.push(CompletionItem {
-                            label: (*enc).to_string(),
-                            kind: Some(CompletionItemKind::ENUM_MEMBER),
-                            detail: Some("crypto digest encoding".to_string()),
-                            insert_text: Some((*enc).to_string()),
-                            // single-line only
-                            filter_text: Some((*enc).to_string()),
-                            sort_text: Some(format!("0{enc}")),
-                            documentation: Some(Documentation::String(format!(
-                                "Node crypto: .digest('{enc}')"
-                            ))),
-                            ..Default::default()
-                        });
-                    }
-                }
-                if !items.is_empty() {
-                    return Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: true,
-                        items,
-                    }));
-                }
-            }
-
-            if let Some(chain_filter) =
-                crypto_hash_chain_filter(&lines, line_idx, before_cursor)
-            {
-                let fl = chain_filter.to_lowercase();
-                let member_start =
-                    member_col(before_cursor, chain_filter.len());
-
-                if fl.is_empty() || "update".starts_with(&fl) {
-                    let insert = CRYPTO_UPDATE_THEN_DIGEST_SNIPPET.to_string();
-                    items.push(CompletionItem {
-                        label: "update(…).digest(…)".to_string(),
-                        kind: Some(CompletionItemKind::SNIPPET),
-                        detail: Some("crypto — full chain through digest".to_string()),
-                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: Range {
-                                start: Position {
-                                    line: line_num,
-                                    character: member_start,
-                                },
-                                end: Position {
-                                    line: line_num,
-                                    character: position.character,
-                                },
-                            },
-                            new_text: insert.clone(),
-                        })),
-                        insert_text: Some(insert),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        // queries: ".", "u", "up", ").", "update"
-                        filter_text: Some("update.digest update ).update .update".into()),
-                        sort_text: Some("00update_digest".into()),
-                        preselect: Some(true),
-                        ..Default::default()
-                    });
-                }
-
-                for (name, desc) in CRYPTO_HASH_CHAIN_PROPS {
-                    if !fl.is_empty() && !name.to_lowercase().starts_with(&fl) {
-                        continue;
-                    }
-                    let (insert, is_snippet) = match *name {
-                        "update" => ("update(${1:data})".to_string(), true),
-                        "digest" => ("digest('${1:base64}')".to_string(), true),
-                        _ => (name.to_string(), false),
-                    };
-                    items.push(CompletionItem {
-                        label: name.to_string(),
-                        kind: Some(CompletionItemKind::METHOD),
-                        detail: Some(format!("crypto chain — {desc}")),
-                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: Range {
-                                start: Position {
-                                    line: line_num,
-                                    character: member_start,
-                                },
-                                end: Position {
-                                    line: line_num,
-                                    character: position.character,
-                                },
-                            },
-                            new_text: insert.clone(),
-                        })),
-                        insert_text: Some(insert),
-                        insert_text_format: if is_snippet {
-                            Some(InsertTextFormat::SNIPPET)
-                        } else {
-                            Some(InsertTextFormat::PLAIN_TEXT)
-                        },
-                        filter_text: Some(format!("{name} ).{name} .{name}")),
-                        sort_text: Some(format!("1{name}")),
-                        documentation: Some(Documentation::String(desc.to_string())),
-                        ..Default::default()
-                    });
-                }
-
-                if !items.is_empty() {
-                    return Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: true,
-                        items,
-                    }));
-                }
-            }
-
-            // Resolve path.filter from dotted_prefix OR suffix fallback (request. / response. …)
-            // Bare id: `signRe` → ("", "signRe") so require bindings / locals always run.
-            let dotted = dotted_prefix(before_cursor)
-                .or_else(|| {
-                    let t = before_cursor.trim_end();
-                    for (suf, path) in [
-                        ("client.global.", "client.global"),
-                        ("response.headers.", "response.headers"),
-                        ("request.headers.", "request.headers"),
-                        ("response.", "response"),
-                        ("request.", "request"),
-                        ("client.", "client"),
-                        ("console.", "console"),
-                        ("crypto.", "crypto"),
-                        ("Buffer.", "Buffer"),
-                        ("JSON.", "JSON"),
-                        ("Math.", "Math"),
-                        ("Object.", "Object"),
-                        ("Array.", "Array"),
-                        ("Date.", "Date"),
-                        ("fs.", "fs"),
-                        ("path.", "path"),
-                    ] {
-                        if t.ends_with(suf) {
-                            return Some((path.to_string(), String::new()));
-                        }
-                    }
-                    for b in &require_bindings {
-                        let suf = format!("{}.", b.name);
-                        if t.ends_with(&suf) {
-                            return Some((b.name.clone(), String::new()));
-                        }
-                    }
-                    for vname in var_types.keys() {
-                        let suf = format!("{vname}.");
-                        if t.ends_with(&suf) {
-                            return Some((vname.clone(), String::new()));
-                        }
-                    }
-                    for (stem, _) in script_catalog.module_roots() {
-                        let suf = format!("{stem}.");
-                        if t.ends_with(&suf) {
-                            return Some((stem, String::new()));
-                        }
-                    }
-                    None
-                })
-                // Last resort bare word (Zed sometimes queries with odd whitespace)
-                .or_else(|| {
-                    let t = before_cursor.trim_end();
-                    if t.ends_with('.') {
-                        return None;
-                    }
-                    let filter: String = t
-                        .chars()
-                        .rev()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
-                    if filter.is_empty() {
-                        // empty line in script — still offer locals with empty filter
-                        Some((String::new(), String::new()))
-                    } else {
-                        Some((String::new(), filter))
-                    }
-                });
-
-            if let Some((path_raw, filter)) = dotted {
-                // const c = require('crypto') → c.xxx uses crypto table
-                let path = resolve_path_with_bindings(&path_raw, &require_bindings);
-                // Display path keeps what the user typed (c.createHmac) for Zed filter_text
+            // Official httpyac roots and members only (Node → vtsls).
+            if let Some((path_raw, filter)) = dotted_prefix(before_cursor) {
+                let path = path_raw.clone();
+                // Display path keeps what the user typed for Zed filter_text
                 let display_path = path_raw.clone();
                 let filter_l = filter.to_lowercase();
-                // Replace range for bare-ident filter (`sign` → `signRequest`) or member filter
+                // Replace range for bare-ident filter (`tes` → `test`) or member filter
                 let member_start =
                     member_col(before_cursor, filter.len());
                 // Byte span of the partial word for text_edit when path is empty
@@ -1418,25 +1191,12 @@ fn completion_sync(
                 // Snippet insert text for well-known method names (editor UX only).
                 let enrich_insert = |name: &str, default: String, is_method: bool| -> (String, bool) {
                     match name {
-                        "createHmac" => (CRYPTO_CREATE_HMAC_SNIPPET.to_string(), true),
-                        "createHash" => (CRYPTO_CREATE_HASH_SNIPPET.to_string(), true),
-                        "randomBytes" => ("randomBytes(${1:16})".to_string(), true),
-                        "randomUUID" => ("randomUUID()".to_string(), true),
-                        "readFileSync" => {
-                            ("readFileSync(${1:path}, '${2:utf8}')".to_string(), true)
-                        }
-                        "update" => ("update(${1:data})".to_string(), true),
-                        "digest" => ("digest('${1:base64}')".to_string(), true),
-                        "log" | "error" | "warn" | "info"
-                            if path == "console" || display_path == "console" =>
-                        {
-                            (format!("{name}($1)"), true)
-                        }
-                        _ if is_method
-                            && default.contains('(') =>
-                        {
-                            (default, true)
-                        }
+                        "sleep" => ("sleep(${1:1000})".to_string(), true),
+                        "test" => (
+                            "test(\"${1:name}\", () => {\n  $0\n})".to_string(),
+                            true,
+                        ),
+                        _ if is_method && default.contains('(') => (default, true),
                         _ if is_method => (format!("{name}($1)"), true),
                         _ => (default, false),
                     }
@@ -1524,26 +1284,35 @@ fn completion_sync(
                     // Keywords / httpyac globals (const, await, test, …)
                     for (name, desc) in SCRIPT_ROOTS {
                         if filter_l.is_empty() || name.to_lowercase().starts_with(&filter_l) {
-                            let kind = if matches!(
-                                *name,
-                                "const" | "let" | "var" | "if" | "for" | "while" | "return"
-                                    | "await" | "async" | "typeof" | "new" | "throw" | "try"
-                            ) {
-                                CompletionItemKind::KEYWORD
-                            } else if matches!(*name, "require") {
+                            let kind = if matches!(*name, "sleep" | "test") {
                                 CompletionItemKind::FUNCTION
+                            } else if matches!(*name, "request" | "response") {
+                                CompletionItemKind::VARIABLE
                             } else {
                                 CompletionItemKind::VARIABLE
+                            };
+                            let commit = if matches!(
+                                *name,
+                                "request" | "response" | "$global" | "$requestClient"
+                                    | "httpFile" | "httpRegion" | "oauth2Session"
+                            ) {
+                                Some(vec![".".to_string()])
+                            } else if matches!(*name, "sleep" | "test") {
+                                Some(vec!["(".to_string()])
+                            } else {
+                                None
                             };
                             items.push(CompletionItem {
                                 label: name.to_string(),
                                 kind: Some(kind),
-                                detail: Some(format!("script — {desc}")),
+                                detail: Some(format!("[httpyac] {desc}")),
                                 insert_text: Some(name.to_string()),
                                 filter_text: Some(name.to_string()),
-                                sort_text: Some(format!("1{name}")),
-                                commit_characters: None,
-                                documentation: Some(Documentation::String(desc.to_string())),
+                                sort_text: Some(format!("0httpyac-{name}")),
+                                commit_characters: commit,
+                                documentation: Some(Documentation::String(format!(
+                                    "[httpyac official] {desc}\n\nhttps://httpyac.github.io/guide/scripting.html"
+                                ))),
                                 ..Default::default()
                             });
                         }
@@ -1835,24 +1604,6 @@ fn completion_sync(
                         is_incomplete: true,
                         items,
                     }));
-                }
-            }
-
-            // require('…') module name completion inside script
-            if let Some(mod_partial) = require_module_partial(before_cursor) {
-                let pl = mod_partial.to_lowercase();
-                for m in REQUIRE_MODULES {
-                    if pl.is_empty() || m.starts_with(pl.as_str()) {
-                        items.push(CompletionItem {
-                            label: format!("'{m}'"),
-                            kind: Some(CompletionItemKind::MODULE),
-                            detail: Some("Node/httpyac require module".to_string()),
-                            insert_text: Some(format!("'{m}'")),
-                            filter_text: Some(m.to_string()),
-                            sort_text: Some(format!("0{m}")),
-                            ..Default::default()
-                        });
-                    }
                 }
             }
 

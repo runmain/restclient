@@ -5,8 +5,10 @@
     "args": ["$ZED_FILE", "$ZED_ROW"],
     "tags": ["http-request"],
     "reveal": "always",
-    "show_summary": false,
-    "show_command": false
+    "use_new_terminal": true,
+    "save": "all",
+    "show_summary": true,
+    "show_command": true
   },
   {
     "label": "🌐 Switch Environment",
@@ -14,8 +16,8 @@
     "args": ["$ZED_FILE", "--switch-env"],
     "tags": ["http-request"],
     "reveal": "always",
-    "show_summary": false,
-    "show_command": false
+    "show_summary": true,
+    "show_command": true
   },
   {
     "label": "🌐 Send with Environment…",
@@ -23,17 +25,8 @@
     "args": ["$ZED_FILE", "$ZED_ROW", "--pick-env"],
     "tags": ["http-request"],
     "reveal": "always",
-    "show_summary": false,
-    "show_command": false
-  },
-  {
-    "label": "⊕ Send in New Tab",
-    "command": "httpyac-run",
-    "args": ["$ZED_FILE", "$ZED_ROW"],
-    "tags": ["http-request"],
-    "reveal": "always",
-    "use_new_terminal": true,
-    "show_summary": false,
-    "show_command": false
+    "save": "all",
+    "show_summary": true,
+    "show_command": true
   }
 ]

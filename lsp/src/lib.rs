@@ -78,6 +78,24 @@ pub fn resolve_effective_env(file_dir: &Path) -> (Option<String>, Vec<String>) {
     collect_env_names(file_dir)
 }
 
+/// Effective env plus environment-file diagnostics for the task runner.
+pub fn resolve_effective_env_with_errors(
+    file_dir: &Path,
+) -> (Option<String>, Vec<String>, Vec<String>) {
+    let mut resolver = VariableResolver::new();
+    let (loaded, errors) = resolver.load_environments_from_dir_with_errors(file_dir);
+    if !loaded {
+        return (None, Vec::new(), errors);
+    }
+    let mut names = resolver.get_available_environment_names();
+    names.sort();
+    (
+        resolver.get_default_environment_name(),
+        names,
+        errors,
+    )
+}
+
 /// Persist selected env by updating `activeEnv` in the nearest `http-client.env.json`.
 /// Does **not** create any extra files.
 pub fn save_active_env(file_dir: &Path, env_name: &str) -> Result<(), String> {
@@ -161,9 +179,10 @@ pub fn ensure_http_url(url: &str, host_header: Option<&str>) -> (String, bool) {
     if u.is_empty() {
         return (u.to_string(), false);
     }
-    // Never rewrite URLs that still contain unresolved {{variables}}
-    // e.g. {{baseUrl}}/get must NOT become http://{{baseUrl}}/get
-    if u.contains("{{") {
+    // A path-only URL can safely be combined with Host even when its query
+    // still contains {{variables}}; httpyac resolves those variables later.
+    // A templated host/base URL must remain untouched for httpyac.
+    if u.contains("{{") && !u.starts_with('/') {
         return (u.to_string(), false);
     }
     // Already absolute with scheme (http, https, ws, …)
@@ -333,5 +352,12 @@ mod url_scheme_tests {
         let (u, c) = ensure_http_url("{{baseUrl}}/get", Some("example.com"));
         assert!(!c);
         assert_eq!(u, "{{baseUrl}}/get");
+    }
+
+    #[test]
+    fn path_with_mustache_query_and_host_gets_http() {
+        let (u, c) = ensure_http_url("/robot/prop?appid={{appid}}", Some("alarm.im.qihoo.net"));
+        assert!(c);
+        assert_eq!(u, "http://alarm.im.qihoo.net/robot/prop?appid={{appid}}");
     }
 }
