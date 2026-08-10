@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use httpyac_lsp::{
-    build_httpyac_send_args, file_dir, resolve_effective_env, resolve_httpyac_bin, save_active_env,
+    build_httpyac_send_args, file_dir, resolve_effective_env_with_errors, resolve_httpyac_bin,
+    save_active_env,
 };
 
 fn main() {
@@ -83,7 +84,19 @@ fn main() {
         }
     });
     let dir = file_dir(&abs_path);
-    let (effective, names) = resolve_effective_env(&dir);
+    let (effective, names, env_errors) = resolve_effective_env_with_errors(&dir);
+    for error in env_errors {
+        eprintln!("环境文件警告: {error}");
+    }
+
+    if !switch_only && !pick && env_name.is_none() {
+        if let Some(active) = effective.as_deref() {
+            if !names.iter().any(|name| name == active) {
+                eprintln!("activeEnv `{active}` 不存在于可用环境: {names:?}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // ── 只切换环境，不发送 ──
     if switch_only {
@@ -152,11 +165,22 @@ fn main() {
 
     // If URL has no scheme: force http:// (not https — may be bare IP).
     // With Host header + path-only URL → http://{Host}{path}
-    let original = std::fs::read_to_string(&abs_path).unwrap_or_default();
+    let original = match std::fs::read_to_string(&abs_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("读取 HTTP 文件失败 ({}): {e}", abs_path.display());
+            std::process::exit(1);
+        }
+    };
     let line_num: usize = line.parse().unwrap_or(1);
     let (send_content, url_note) =
-        httpyac_lsp::rewrite_url_scheme_in_content(&original, line_num)
-            .unwrap_or_else(|_| (original.clone(), None));
+        match httpyac_lsp::rewrite_url_scheme_in_content(&original, line_num) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("解析请求行失败（未展开变量，变量仍交给 httpyac）: {e}");
+                std::process::exit(1);
+            }
+        };
 
     let use_temp = url_note.is_some() && send_content != original;
     let (file_for_cli, tmp_path) = if use_temp {
@@ -220,7 +244,13 @@ fn main() {
     }
 
     match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Ok(s) => {
+            let code = s.code().unwrap_or(1);
+            if !s.success() {
+                eprintln!("httpyac 执行失败，退出码: {code}");
+            }
+            std::process::exit(code);
+        }
         Err(e) => {
             eprintln!(
                 "无法启动 httpyac ({httpyac}): {e}\n\

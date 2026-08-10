@@ -1,24 +1,23 @@
 //! Child **vtsls** process for script islands inside `.http` buffers.
 //!
 //! This is **not** Zed-managed vtsls (that only attaches to real JS/TS buffers).
-//! httpyac-lsp can spawn `@vtsls/language-server` (`vtsls --stdio`) **or** use the
-//! built-in script catalog — **mutually exclusive** in script regions (see
-//! [`ScriptCompletionSource`]).
+//! httpyac-lsp spawns `@vtsls/language-server` (`vtsls --stdio`) when enabled and
+//! **merges** its completions with the official httpyac model snapshot
+//! (`request` / `response` / `$global` / …).
 //!
 //! Configure with (priority high → low):
 //! 1. `lsp.httpyac-lsp.settings.vtslsCommand`
 //! 2. env `HTTPYAC_VTSLS_COMMAND`
 //! 3. `PATH` → `vtsls`
 //!
-//! Script engine (pick **one**):
-//! - `useBuiltinScriptCompletions: true` (default) → catalog only
-//! - `useBuiltinScriptCompletions: false` / `scriptCompletionSource: "vtsls"` → child vtsls only
+//! Official httpyac tips always come from the catalog; Node/JS tips come from
+//! child vtsls when the binary is available (always attempted; no toggle).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -30,123 +29,28 @@ use tower_lsp::Client;
 
 
 
-/// Which engine answers **script-island** completions (Host / `{{var}}` always catalog).
-/// **Mutually exclusive** — never merge both in one popup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScriptCompletionSource {
-    /// Built-in httpyac catalog (`.script` / `@returns` / require shapes).
-    Builtin,
-    /// Child `@vtsls/language-server` process only.
-    Vtsls,
-}
-
-impl Default for ScriptCompletionSource {
-    fn default() -> Self {
-        // Stable default: curated tips without requiring vtsls.
-        Self::Builtin
-    }
-}
-
-impl ScriptCompletionSource {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "builtin" | "catalog" | "httpyac" | "built-in" | "internal" => Some(Self::Builtin),
-            "vtsls" | "ts" | "typescript" | "external" => Some(Self::Vtsls),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Vtsls => "vtsls",
-        }
-    }
-}
-
-/// User / init settings for script completion + child vtsls.
+/// User / init settings for child vtsls (merged with official httpyac models).
+/// Child vtsls is always attempted when the binary is available (no toggle).
 #[derive(Debug, Clone)]
 pub struct VtslsSettings {
-    /// When `source == Vtsls`, allow spawning the child (false → force builtin).
-    pub enabled: bool,
-    /// Script-region engine: **builtin XOR vtsls** (not both).
-    pub source: ScriptCompletionSource,
     /// Absolute or PATH command, e.g. `/…/bin/vtsls`.
     pub command: Option<String>,
     pub args: Vec<String>,
-    /// True if `source` was set explicitly in the last `from_json` (for merge).
-    source_explicit: bool,
-    enabled_explicit: bool,
 }
 
 impl Default for VtslsSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
-            source: ScriptCompletionSource::Builtin,
             command: None,
             args: vec!["--stdio".into()],
-            source_explicit: false,
-            enabled_explicit: false,
         }
     }
 }
 
 impl VtslsSettings {
-    /// Effective engine for script islands (applies `vtslsEnabled: false` → builtin).
-    pub fn script_source(&self) -> ScriptCompletionSource {
-        if !self.enabled {
-            return ScriptCompletionSource::Builtin;
-        }
-        self.source
-    }
-
     /// Merge JSON from `initializationOptions` or `lsp.httpyac-lsp.settings`.
     pub fn from_json(v: &Value) -> Self {
         let mut s = Self::default();
-
-        if let Some(b) = v
-            .get("vtslsEnabled")
-            .or_else(|| v.get("vtsls_enabled"))
-            .and_then(|x| x.as_bool())
-        {
-            s.enabled = b;
-            s.enabled_explicit = true;
-        }
-
-        // Explicit source string (preferred)
-        for key in [
-            "scriptCompletionSource",
-            "script_completion_source",
-            "scriptEngine",
-            "script_engine",
-        ] {
-            if let Some(raw) = v.get(key).and_then(|x| x.as_str()) {
-                if let Some(src) = ScriptCompletionSource::parse(raw) {
-                    s.source = src;
-                    s.source_explicit = true;
-                    break;
-                }
-            }
-        }
-
-        // Boolean: whether to use **built-in** catalog (user-facing name)
-        for key in [
-            "useBuiltinScriptCompletions",
-            "use_builtin_script_completions",
-            "useBuiltinScript",
-            "use_builtin_script",
-        ] {
-            if let Some(b) = v.get(key).and_then(|x| x.as_bool()) {
-                s.source = if b {
-                    ScriptCompletionSource::Builtin
-                } else {
-                    ScriptCompletionSource::Vtsls
-                };
-                s.source_explicit = true;
-                break;
-            }
-        }
 
         // camelCase + snake_case command
         for key in ["vtslsCommand", "vtsls_command"] {
@@ -172,14 +76,6 @@ impl VtslsSettings {
     pub fn merge_from(&mut self, other: &VtslsSettings) {
         if other.command.is_some() {
             self.command = other.command.clone();
-        }
-        if other.enabled_explicit {
-            self.enabled = other.enabled;
-            self.enabled_explicit = true;
-        }
-        if other.source_explicit {
-            self.source = other.source;
-            self.source_explicit = true;
         }
         if !other.args.is_empty()
             && (other.args != vec!["--stdio".to_string()] || self.args.is_empty())
@@ -249,19 +145,18 @@ fn which_ok(name: &str) -> bool {
 
 /// Line-aligned **plain JavaScript** (one output line per HTTP line).
 ///
-/// No TypeScript `declare` preamble — that broke parity with real `.js` buffers
-/// (`auth-sign.js`). httpyac globals live in `httpyac-vtsls-globals.d.ts`; Node
-/// APIs come from `@types/node` via jsconfig (same as opening a real JS file).
+/// The first line is a TypeScript reference directive for the official
+/// httpyac model snapshot. The remaining lines stay aligned with the `.http`
+/// buffer, so only the fixed preamble offset needs to be remapped.
 ///
-/// Returns `(js_text, preamble_lines)` where `preamble_lines` is **0** so LSP
-/// positions map 1:1 with the `.http` buffer.
+/// Returns `(js_text, preamble_lines)` where `preamble_lines` is **1**.
 ///
 /// Only script islands are emitted:
 /// - multi-line `{{ … }}` pre/post request blocks
 /// - `> {% … %}` / handler percent blocks
 /// - true inline JS lines (const/require/…) — never HTTP comments like `## …`
 pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
-    let mut out = String::new();
+    let mut out = String::from("/// <reference path=\"./httpyac-vtsls-globals.d.ts\" />\n");
     let mut in_mustache = false; // multi-line {{ … }}
     let mut in_percent = false; // {% … %}
 
@@ -344,7 +239,7 @@ pub fn build_virtual_typescript(http_src: &str) -> (String, u32) {
         out.push('\n');
     }
 
-    (out, 0)
+    (out, 1)
 }
 
 /// True JS statement (const/let/require/exports/…) — not a bare mustache var.
@@ -428,6 +323,9 @@ pub fn shadow_js_path(http_uri: &Url) -> Option<PathBuf> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
+    // Bump this when the shadow layout changes so stale full-snapshot files
+    // are never reused after switching to dependency-closure copying.
+    "httpyac-model-closure-v1".hash(&mut h);
     p.hash(&mut h);
     let hash = format!("{:x}", h.finish());
     let fname = p
@@ -527,6 +425,107 @@ fn rewrite_relative_requires(js: &str, http_dir: &Path) -> String {
     out
 }
 
+fn httpyac_globals_source() -> Result<PathBuf, String> {
+    let relative = Path::new("httpyac-models/httpyac-globals.d.ts");
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join(relative));
+        }
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(relative),
+    );
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "httpyac 官方类型文件不存在：请安装 lsp/httpyac-models/httpyac-globals.d.ts"
+                .to_string()
+        })
+}
+
+fn install_httpyac_globals(target_dir: &Path) -> Result<(), String> {
+    let source = httpyac_globals_source()?;
+    let target = target_dir.join("httpyac-vtsls-globals.d.ts");
+    let content = fs::read_to_string(&source)
+        .map_err(|e| format!("read {}: {e}", source.display()))?;
+    fs::write(&target, content).map_err(|e| format!("write {}: {e}", target.display()))?;
+
+    let source_root = source
+        .parent()
+        .ok_or_else(|| format!("invalid httpyac type path: {}", source.display()))?;
+    let mut queue = VecDeque::from([source.to_path_buf()]);
+    let mut visited = HashSet::new();
+    while let Some(source_file) = queue.pop_front() {
+        if !visited.insert(source_file.clone()) || !source_file.is_file() {
+            continue;
+        }
+        let relative = source_file
+            .strip_prefix(source_root)
+            .map_err(|e| format!("snapshot path {}: {e}", source_file.display()))?;
+        let target_file = target_dir.join(relative);
+        if let Some(parent) = target_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        fs::copy(&source_file, &target_file).map_err(|e| {
+            format!(
+                "copy {} to {}: {e}",
+                source_file.display(),
+                target_file.display()
+            )
+        })?;
+
+        let content = fs::read_to_string(&source_file)
+            .map_err(|e| format!("read {}: {e}", source_file.display()))?;
+        for specifier in snapshot_relative_imports(&content) {
+            if let Some(dependency) = resolve_snapshot_dependency(&source_file, &specifier) {
+                queue.push_back(dependency);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_relative_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        for quote in ['\'', '"'] {
+            let marker = format!("{quote}.");
+            let mut offset = 0;
+            while let Some(found) = line[offset..].find(&marker) {
+                let start = offset + found + 1;
+                let Some(end_rel) = line[start..].find(quote) else {
+                    break;
+                };
+                let end = start + end_rel;
+                let specifier = &line[start..end];
+                if specifier.starts_with("./") || specifier.starts_with("../") {
+                    imports.push(specifier.to_string());
+                }
+                offset = end + 1;
+            }
+        }
+    }
+    imports.sort();
+    imports.dedup();
+    imports
+}
+
+fn resolve_snapshot_dependency(source_file: &Path, specifier: &str) -> Option<PathBuf> {
+    let base = source_file.parent()?.join(specifier);
+    let candidates = [
+        base.clone(),
+        base.with_extension("ts"),
+        base.with_extension("d.ts"),
+        base.join("index.ts"),
+        base.join("index.d.ts"),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 /// jsconfig inside the /tmp shadow dir; baseUrl = real http folder for module resolve.
 fn ensure_jsconfig_for_shadow_dir(shadow_dir: &Path, http_dir: &Path) -> Result<(), String> {
     let jsconfig = shadow_dir.join("jsconfig.json");
@@ -551,6 +550,7 @@ fn ensure_jsconfig_for_shadow_dir(shadow_dir: &Path, http_dir: &Path) -> Result<
     compiler.insert("checkJs".into(), json!(true));
     compiler.insert("strict".into(), json!(false));
     compiler.insert("noEmit".into(), json!(true));
+    compiler.insert("skipLibCheck".into(), json!(true));
     compiler.insert("moduleResolution".into(), json!("node"));
     compiler.insert("types".into(), json!(["node"]));
     compiler.insert("baseUrl".into(), json!(http_dir.to_string_lossy()));
@@ -559,41 +559,10 @@ fn ensure_jsconfig_for_shadow_dir(shadow_dir: &Path, http_dir: &Path) -> Result<
     }
     let doc = json!({
         "compilerOptions": compiler,
+        "files": ["./httpyac-vtsls-globals.d.ts"],
         "include": ["./**/*.js", "./**/*.__vtsls__.js"]
     });
-    // httpyac globals in the tmp dir
-    let globals = shadow_dir.join("httpyac-vtsls-globals.d.ts");
-    if !globals.is_file() {
-        let _ = fs::write(
-            &globals,
-            r#"/** Auto-generated for httpyac-lsp child vtsls — httpyac script globals */
-declare const request: {
-  method: string;
-  url: string;
-  headers: Record<string, string> & { set?(k: string, v: string): void; get?(k: string): string };
-  body?: unknown;
-  [key: string]: unknown;
-};
-declare const response: {
-  statusCode: number;
-  status: number;
-  headers: Record<string, string>;
-  body: string | unknown;
-  parsedBody?: unknown;
-  [key: string]: unknown;
-};
-declare const client: {
-  test(name: string, fn: () => void): void;
-  assert(cond: unknown, message?: string): void;
-  log(...args: unknown[]): void;
-  global: { get(k: string): unknown; set(k: string, v: unknown): void; clear(k?: string): void };
-  [key: string]: unknown;
-};
-declare const exports: Record<string, unknown>;
-declare function test(name: string, fn: () => void): void;
-"#,
-        );
-    }
+    install_httpyac_globals(shadow_dir)?;
     fs::write(
         &jsconfig,
         serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())? + "\n",
@@ -647,6 +616,7 @@ fn ensure_jsconfig_for_http_dir(http_dir: &Path) -> Result<(), String> {
     compiler.insert("checkJs".into(), json!(true));
     compiler.insert("strict".into(), json!(false));
     compiler.insert("noEmit".into(), json!(true));
+    compiler.insert("skipLibCheck".into(), json!(true));
     compiler.insert("moduleResolution".into(), json!("node"));
     compiler.insert("types".into(), json!(["node"]));
     if !type_roots.is_empty() {
@@ -655,6 +625,7 @@ fn ensure_jsconfig_for_http_dir(http_dir: &Path) -> Result<(), String> {
 
     let doc = json!({
         "compilerOptions": compiler,
+        "files": ["./httpyac-vtsls-globals.d.ts"],
         "include": [
             "./**/*.js",
             "./**/*.cjs",
@@ -663,39 +634,7 @@ fn ensure_jsconfig_for_http_dir(http_dir: &Path) -> Result<(), String> {
             "./scripts/**/*.js"
         ]
     });
-    // httpyac globals for script islands (request/response/…)
-    let globals = http_dir.join("httpyac-vtsls-globals.d.ts");
-    if !globals.is_file() {
-        let _ = fs::write(
-            &globals,
-            r#"/** Auto-generated for httpyac-lsp child vtsls — httpyac script globals */
-declare const request: {
-  method: string;
-  url: string;
-  headers: Record<string, string> & { set?(k: string, v: string): void; get?(k: string): string };
-  body?: unknown;
-  [key: string]: unknown;
-};
-declare const response: {
-  statusCode: number;
-  status: number;
-  headers: Record<string, string>;
-  body: string | unknown;
-  parsedBody?: unknown;
-  [key: string]: unknown;
-};
-declare const client: {
-  test(name: string, fn: () => void): void;
-  assert(cond: unknown, message?: string): void;
-  log(...args: unknown[]): void;
-  global: { get(k: string): unknown; set(k: string, v: unknown): void; clear(k?: string): void };
-  [key: string]: unknown;
-};
-declare const exports: Record<string, unknown>;
-declare function test(name: string, fn: () => void): void;
-"#,
-        );
-    }
+    install_httpyac_globals(http_dir)?;
 
     fs::write(
         &jsconfig,
@@ -720,6 +659,7 @@ pub struct VtslsProxy {
     versions: Mutex<HashMap<String, i32>>,
     preamble_lines: u32,
     command_path: String,
+    alive: Arc<AtomicBool>,
 }
 
 impl VtslsProxy {
@@ -750,12 +690,23 @@ impl VtslsProxy {
         let stdin = Arc::new(Mutex::new(stdin));
         let pending_r = pending.clone();
         let stdin_r = stdin.clone();
+        let pending_fail = pending.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_r = alive.clone();
 
         // Read stdout: complete our requests + **answer server→client requests**
         // (vtsls blocks on workspace/configuration if we never reply → completion timeout).
         tokio::spawn(async move {
-            if let Err(e) = read_lsp_stdout(stdout, pending_r, stdin_r).await {
-                eprintln!("[httpyac-lsp] vtsls reader ended: {e}");
+            let result = read_lsp_stdout(stdout, pending_r, stdin_r).await;
+            alive_r.store(false, Ordering::SeqCst);
+            let error = match result {
+                Ok(()) => "vtsls stdout closed".to_string(),
+                Err(e) => e,
+            };
+            eprintln!("[httpyac-lsp] vtsls reader ended: {error}");
+            let mut pending = pending_fail.lock().await;
+            for (_, tx) in pending.map.drain() {
+                let _ = tx.send(Err(error.clone()));
             }
         });
 
@@ -786,9 +737,10 @@ impl VtslsProxy {
             pending,
             next_id: AtomicU64::new(1),
             versions: Mutex::new(HashMap::new()),
-            // Line-aligned plain JS shadow → positions match .http 1:1 (no TS preamble).
-            preamble_lines: 0,
+            // One reference-directive line precedes the line-aligned JS shadow.
+            preamble_lines: 1,
             command_path: command.to_string(),
+            alive,
         };
 
         proxy.initialize(workspace_root).await?;
@@ -840,6 +792,10 @@ impl VtslsProxy {
 
     pub fn preamble_lines(&self) -> u32 {
         self.preamble_lines
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     async fn write_message(&self, body: &Value) -> Result<(), String> {
@@ -895,7 +851,17 @@ impl VtslsProxy {
     /// `$TMPDIR/httpyac-vtsls/<hash>/` (not the project tree), then tell vtsls.
     pub async fn sync_document(&self, http_uri: &Url, http_text: &str) -> Result<(), String> {
         let (virtual_text, preamble) = build_virtual_typescript(http_text);
-        debug_assert_eq!(preamble, 0, "shadow JS must stay line-aligned with .http");
+        debug_assert_eq!(preamble, self.preamble_lines);
+
+        #[cfg(not(unix))]
+        let virtual_text = match http_uri
+            .to_file_path()
+            .ok()
+            .and_then(|http_path| http_path.parent().map(Path::to_path_buf))
+        {
+            Some(http_dir) => rewrite_relative_requires(&virtual_text, &http_dir),
+            None => virtual_text,
+        };
 
         // Materialize under $TMPDIR; symlink real http dir entries so
         // require('./scripts/…') still works without rewriting paths.
@@ -1008,7 +974,14 @@ impl VtslsProxy {
                 params["context"] = v;
             }
         }
-        let raw = self.request("textDocument/completion", params).await?;
+        let mut raw = self.request("textDocument/completion", params.clone()).await?;
+        for _ in 0..4 {
+            if !completion_response_is_empty(&raw) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            raw = self.request("textDocument/completion", params.clone()).await?;
+        }
         Ok(map_completion_response(raw, self.preamble_lines))
     }
 
@@ -1023,6 +996,8 @@ impl VtslsProxy {
         let keep_label = item.label.clone();
         let keep_filter = item.filter_text.clone();
         let keep_sort = item.sort_text.clone();
+        let keep_kind = item.kind;
+        let keep_label_details = item.label_details.clone();
         let keep_range = item.text_edit.as_ref().map(|e| match e {
             CompletionTextEdit::Edit(t) => t.range,
             CompletionTextEdit::InsertAndReplace(ir) => ir.replace,
@@ -1042,6 +1017,12 @@ impl VtslsProxy {
         }
         if keep_sort.is_some() {
             resolved.sort_text = keep_sort;
+        }
+        if keep_kind.is_some() {
+            resolved.kind = keep_kind;
+        }
+        if keep_label_details.is_some() {
+            resolved.label_details = keep_label_details;
         }
         // Apply completeFunctionCalls snippet into text_edit (Zed uses text_edit on accept)
         apply_function_call_snippet(&mut resolved, keep_range);
@@ -1183,6 +1164,19 @@ fn map_completion_response(raw: Value, preamble: u32) -> Option<CompletionRespon
         return Some(CompletionResponse::List(list));
     }
     None
+}
+
+fn completion_response_is_empty(raw: &Value) -> bool {
+    if raw.is_null() {
+        return true;
+    }
+    if let Some(items) = raw.as_array() {
+        return items.is_empty();
+    }
+    raw.get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.is_empty())
+        .unwrap_or(false)
 }
 
 /// Keep vtsls/tsserver completion UI **as-is** (same as opening auth-sign.js):
@@ -1490,31 +1484,17 @@ impl VtslsBridge {
         s.merge_from(&parsed);
     }
 
-    /// Current script completion engine (builtin | vtsls).
-    pub async fn script_source(&self) -> ScriptCompletionSource {
-        self.settings.lock().await.script_source()
-    }
-
     pub async fn ensure_started(
         &self,
         client: &Client,
         workspace_root: Option<PathBuf>,
     ) -> Option<()> {
-        {
-            let s = self.settings.lock().await;
-            // Only spawn when user chose vtsls engine
-            if s.script_source() != ScriptCompletionSource::Vtsls {
-                return None;
-            }
-            if !s.enabled {
-                return None;
-            }
-        }
-        {
-            let p = self.proxy.lock().await;
-            if p.is_some() {
+        let mut proxy_slot = self.proxy.lock().await;
+        if let Some(proxy) = proxy_slot.as_ref() {
+            if proxy.is_alive() {
                 return Some(());
             }
+            *proxy_slot = None;
         }
 
         let cmd = {
@@ -1528,7 +1508,7 @@ impl VtslsBridge {
                 client
                     .log_message(
                         MessageType::WARNING,
-                        "httpyac-lsp: vtsls not found — script IntelliSense uses catalog only. \
+                        "httpyac-lsp: vtsls not found — script IntelliSense is unavailable (HTTP/mustache completion remains available). \
                          Install: npm install -g @vtsls/language-server \
                          then set httpyac.vtsls_command or lsp.httpyac-lsp.settings.vtslsCommand \
                          (re-run ./install_to_zed.sh to probe/write paths).",
@@ -1553,7 +1533,7 @@ impl VtslsBridge {
                         ),
                     )
                     .await;
-                *self.proxy.lock().await = Some(proxy);
+                *proxy_slot = Some(proxy);
                 Some(())
             }
             Err(e) => {
@@ -1566,9 +1546,11 @@ impl VtslsBridge {
     }
 
     pub async fn sync(&self, uri: &Url, text: &str) {
-        let p = self.proxy.lock().await;
+        let mut p = self.proxy.lock().await;
         if let Some(proxy) = p.as_ref() {
-            let _ = proxy.sync_document(uri, text).await;
+            if !proxy.is_alive() || proxy.sync_document(uri, text).await.is_err() {
+                *p = None;
+            }
         }
     }
 
@@ -1602,13 +1584,12 @@ GET https://example.com
 Host: x
 "#;
         let (virt, preamble) = build_virtual_typescript(src);
-        assert_eq!(preamble, 0, "plain JS shadow is 1:1 with .http lines");
+        assert_eq!(preamble, 1, "one reference directive precedes the JS shadow");
         let http_lines = src.lines().count();
-        assert_eq!(virt.lines().count(), http_lines);
+        assert_eq!(virt.lines().count(), http_lines + 1);
         assert!(virt.contains("createHmac"));
         assert!(!virt.contains("GET https://"));
-        // Must stay plain JS (no TS declare) — same as auth-sign.js
-        assert!(!virt.contains("declare const"));
+        assert!(virt.starts_with("/// <reference path=\"./httpyac-vtsls-globals.d.ts\" />"));
     }
 
     #[test]
@@ -1624,37 +1605,23 @@ Host: x
 
     #[test]
     fn settings_parse_snake_and_camel() {
-        let v = json!({"vtsls_command": "/bin/vtsls", "vtslsEnabled": true});
+        let v = json!({"vtsls_command": "/bin/vtsls"});
         let s = VtslsSettings::from_json(&v);
         assert_eq!(s.command.as_deref(), Some("/bin/vtsls"));
-        assert!(s.enabled);
-        // default engine remains builtin unless toggled
-        assert_eq!(s.script_source(), ScriptCompletionSource::Builtin);
     }
 
     #[test]
-    fn settings_use_builtin_flag_and_source_string() {
-        let builtin = VtslsSettings::from_json(&json!({
-            "useBuiltinScriptCompletions": true
-        }));
-        assert_eq!(builtin.script_source(), ScriptCompletionSource::Builtin);
-
-        let vtsls = VtslsSettings::from_json(&json!({
-            "useBuiltinScriptCompletions": false,
+    fn settings_vtsls_command_only() {
+        let s = VtslsSettings::from_json(&json!({
             "vtslsCommand": "/bin/vtsls"
         }));
-        assert_eq!(vtsls.script_source(), ScriptCompletionSource::Vtsls);
+        assert_eq!(s.command.as_deref(), Some("/bin/vtsls"));
 
-        let by_str = VtslsSettings::from_json(&json!({
-            "scriptCompletionSource": "vtsls"
+        // Unknown / legacy keys must not set command
+        let legacy = VtslsSettings::from_json(&json!({
+            "unrelated": true
         }));
-        assert_eq!(by_str.script_source(), ScriptCompletionSource::Vtsls);
-
-        let disabled = VtslsSettings::from_json(&json!({
-            "scriptCompletionSource": "vtsls",
-            "vtslsEnabled": false
-        }));
-        assert_eq!(disabled.script_source(), ScriptCompletionSource::Builtin);
+        assert!(legacy.command.is_none());
     }
 
     #[test]
@@ -1710,18 +1677,18 @@ Host: x
     }
 
     #[test]
-    fn http_cursor_maps_1to1_when_preamble_zero() {
-        // Shipped proxy uses preamble_lines=0 for plain JS shadows
+    fn http_cursor_maps_with_model_reference_preamble() {
+        // The shadow starts with one reference-directive line.
         let http_line = 31u32;
         let http_col = 9u32;
         let pos = Position {
             line: http_line,
             character: http_col,
         };
-        let v = http_pos_to_virtual(pos, 0);
-        assert_eq!(v.line, http_line);
+        let v = http_pos_to_virtual(pos, 1);
+        assert_eq!(v.line, http_line + 1);
         assert_eq!(v.character, http_col);
-        let back = virtual_pos_to_http(v, 0);
+        let back = virtual_pos_to_http(v, 1);
         assert_eq!(back.line, http_line);
         assert_eq!(back.character, http_col);
     }
@@ -1731,8 +1698,8 @@ Host: x
         // Synthetic buffer matching user shape (crypto. after require) — not disk dirty state
         let http = "### POST\n{{\n  const crypto = require('crypto');\n  crypto.\n  const date = new Date();\n}}\n";
         let (virt, preamble) = build_virtual_typescript(http);
-        assert_eq!(preamble, 0);
-        assert_eq!(virt.lines().count(), http.lines().count(), "1:1 line align");
+        assert_eq!(preamble, 1);
+        assert_eq!(virt.lines().count(), http.lines().count() + 1, "fixed preamble + line align");
         assert!(virt.contains("require('crypto')"), "missing require: {virt}");
         assert!(
             virt.lines().any(|l| l.trim().starts_with("crypto.")),
@@ -1779,7 +1746,10 @@ mod live_vtsls {
   signe
 }}
 "#;
-        let uri = Url::from_file_path(root.join("script-vtsls.http")).unwrap();
+        let uri = Url::from_file_path(
+            std::env::temp_dir().join("httpyac-lsp-global-request.http"),
+        )
+        .unwrap();
         proxy.sync_document(&uri, http).await.expect("sync");
         // position on "signe" — line index: ###=0, {{=1, const=2, signe=3
         // "  signe" — cursor after the word (col 7)
@@ -1966,6 +1936,65 @@ POST https://example.com
                     edit.range
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_httpyac_global_request_members_from_models_snapshot() {
+        let cmd = resolve_vtsls_command(None).expect("vtsls");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples");
+        let proxy = VtslsProxy::spawn(&cmd, &["--stdio".into()], Some(root.clone()))
+            .await
+            .expect("spawn");
+        let http = "###\n{{\n  request.\n}}\n";
+        let uri = Url::from_file_path(
+            std::env::temp_dir().join("httpyac-lsp-global-request.http"),
+        )
+        .unwrap();
+        proxy.sync_document(&uri, http).await.expect("sync");
+        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+        let res = proxy
+            .completion(
+                &uri,
+                Position {
+                    line: 2,
+                    character: 10,
+                },
+                None,
+            )
+            .await
+            .expect("completion");
+        let labels: Vec<String> = match res {
+            Some(CompletionResponse::Array(items)) => items.into_iter().map(|item| item.label).collect(),
+            Some(CompletionResponse::List(list)) => list.items.into_iter().map(|item| item.label).collect(),
+            None => Vec::new(),
+        };
+        assert!(labels.iter().any(|label| label == "url"), "request.url missing: {labels:?}");
+        assert!(labels.iter().any(|label| label == "method?"), "request.method missing: {labels:?}");
+        assert!(labels.iter().any(|label| label == "headers?"), "request.headers missing: {labels:?}");
+        assert!(labels.iter().any(|label| label == "options?"), "request.options missing: {labels:?}");
+    }
+
+    #[test]
+    fn bundled_httpyac_global_bindings_cover_official_roots() {
+        let source = include_str!("../httpyac-models/httpyac-globals.d.ts");
+        for name in [
+            "$global",
+            "$requestClient",
+            "httpFile",
+            "httpRegion",
+            "oauth2Session",
+            "request",
+            "response",
+            "sleep",
+            "test",
+            "__dirname",
+            "__filename",
+        ] {
+            assert!(source.contains(name), "missing bundled global {name}");
         }
     }
 

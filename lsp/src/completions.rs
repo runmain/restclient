@@ -135,225 +135,120 @@ pub const BUILTIN_VARS: &[(&str, &str)] = &[
     ("$guid", "Alias for UUID"),
 ];
 
-/// Top-level objects in httpyac / response scripts.
-pub const SCRIPT_ROOTS: &[(&str, &str)] = &[
-    // httpyac primary (see https://httpyac.github.io/guide/scripting.html)
-    ("response", "HTTP response (post-request / @forceRef)"),
-    ("request", "Next HTTP request (pre-request; mutable)"),
-    ("client", "IntelliJ-style client (global, test, assert, log)"),
-    ("console", "console.log / info / warn / error → httpyac output"),
-    ("exports", "Pre-request exports.NAME → {{NAME}}"),
-    ("$global", "Global variable store across requests"),
-    ("test", "test(name, fn) — built-in test helper"),
-    ("sleep", "await sleep(ms)"),
-    ("httpFile", "Current http file"),
-    ("httpRegion", "Current request region"),
-    ("$requestClient", "Streaming request client"),
-    ("oauth2Session", "OAuth2 session when used"),
-    ("__dirname", "Directory of current module/file"),
-    ("__filename", "Current file path"),
-    // Common JS / Node in httpyac VM
-    ("JSON", "JSON.parse / JSON.stringify"),
-    ("Math", "Math.* helpers"),
-    ("Date", "Date / Date.now()"),
-    ("Object", "Object.keys / assign / …"),
-    ("Array", "Array.isArray / from / …"),
-    ("String", "String helpers"),
-    ("Number", "Number helpers"),
-    ("Boolean", "Boolean()"),
-    ("Error", "throw new Error(…)"),
-    ("Buffer", "Node Buffer (if runtime provides it)"),
-    ("require", "require('crypto' | 'fs' | 'assert' | …)"),
-    ("crypto", "Often via require('crypto') — also bare after require"),
-    ("assert", "Often via require('assert')"),
-    ("const", "JS const binding"),
-    ("let", "JS let binding"),
-    ("var", "JS var binding"),
-    ("if", "if (…) { … }"),
-    ("for", "for / for…of"),
-    ("while", "while (…)"),
-    ("return", "return …"),
-    ("await", "await (if async context)"),
-    ("async", "async function / arrow"),
-    ("true", "boolean true"),
-    ("false", "boolean false"),
-    ("null", "null"),
-    ("undefined", "undefined"),
-    ("typeof", "typeof x"),
-    ("new", "new Constructor(…)"),
-    ("throw", "throw error"),
-    ("try", "try { … } catch"),
-    ("debugger", "debugger; for CLI debug"),
+/// Official httpyac script globals on the VM global object.
+/// Source: https://httpyac.github.io/guide/scripting.html — “Access to Variables”.
+/// Node/JS APIs (`crypto`, `JSON`, keywords, …) are left to child vtsls, not listed here.
+///
+/// Tuple: `(name, description, condition)` — condition empty means always available.
+pub const HTTPYAC_OFFICIAL_GLOBALS: &[(&str, &str, &str)] = &[
+    (
+        "$global",
+        "Object which allows storing global Variables",
+        "",
+    ),
+    (
+        "$requestClient",
+        "requestClient to send additional body in streaming event",
+        "",
+    ),
+    ("httpFile", "current httpFile", ""),
+    ("httpRegion", "current httpRegion", ""),
+    (
+        "oauth2Session",
+        "OAuth2 Response",
+        "only if OAuth2/ OpenId Connect is used",
+    ),
+    ("request", "request of the next http request", ""),
+    (
+        "response",
+        "http response of the last executed request",
+        "only use it in post request scripts or for responses imported with @forceRef",
+    ),
+    (
+        "sleep",
+        "Method to wait for a fixed period of time",
+        "",
+    ),
+    (
+        "test",
+        "method to simplify tests (assert or chai)",
+        "",
+    ),
+    (
+        "__dirname",
+        "path to current working directory",
+        "",
+    ),
+    (
+        "__filename",
+        "The file name of the current module",
+        "",
+    ),
 ];
 
-/// Completions after `response.` (httpyac HttpResponse + common aliases)
+/// Bare roots offered in script islands (official globals only).
+pub const SCRIPT_ROOTS: &[(&str, &str)] = &[
+    ("$global", "Object which allows storing global Variables"),
+    (
+        "$requestClient",
+        "requestClient to send additional body in streaming event",
+    ),
+    ("httpFile", "current httpFile"),
+    ("httpRegion", "current httpRegion"),
+    (
+        "oauth2Session",
+        "OAuth2 Response (only if OAuth2/ OpenId Connect is used)",
+    ),
+    ("request", "request of the next http request"),
+    (
+        "response",
+        "http response of the last executed request (post-request / @forceRef)",
+    ),
+    ("sleep", "Method to wait for a fixed period of time"),
+    ("test", "method to simplify tests (assert or chai)"),
+    ("__dirname", "path to current working directory"),
+    ("__filename", "The file name of the current module"),
+];
+
+/// Completions after `response.` — httpyac `HttpResponse` fields only
+/// (`dist/models/httpResponse.d.ts`). No IntelliJ aliases (`status`, `responseTime`).
 pub const RESPONSE_PROPS: &[(&str, &str)] = &[
+    ("protocol", "Protocol (HTTP, …)"),
+    ("name", "Response / request name if set"),
+    ("httpVersion", "HTTP version string"),
     ("statusCode", "HTTP status code (number)"),
-    ("status", "Status code (alias / JetBrains-style)"),
     ("statusMessage", "Reason phrase"),
-    ("headers", "Response headers object"),
+    ("headers", "Response headers (Record; use bracket access)"),
+    ("contentType", "Parsed content-type"),
     ("body", "Body (string / object depending on content)"),
     ("parsedBody", "Parsed JSON/XML body when available"),
     ("prettyPrintBody", "Pretty-printed body string"),
-    ("contentType", "Parsed content-type"),
-    ("rawBody", "Raw body Buffer"),
     ("rawHeaders", "Raw header lines"),
-    ("httpVersion", "HTTP version string"),
-    ("protocol", "Protocol (HTTP, etc.)"),
-    ("name", "Response / request name if set"),
+    ("rawBody", "Raw body Buffer"),
     ("request", "The request object that produced this response"),
     ("timings", "Timing phases (HttpTimings)"),
     ("meta", "Extra metadata map"),
     ("tags", "Tags array"),
-    ("responseTime", "Timing (ms), if available (alias)"),
 ];
 
-/// Completions after `response.headers.`
-pub const RESPONSE_HEADERS_PROPS: &[(&str, &str)] = &[
-    ("valueOf", "headers.valueOf(\"Name\") — JetBrains-style"),
-    ("get", "headers.get(\"Name\") / bracket access"),
+/// Completions after `response.timings.` — httpyac `HttpTimings`.
+pub const RESPONSE_TIMINGS_PROPS: &[(&str, &str)] = &[
+    ("wait", "timings.wait"),
+    ("dns", "timings.dns"),
+    ("tcp", "timings.tcp"),
+    ("tls", "timings.tls"),
+    ("request", "timings.request"),
+    ("firstByte", "timings.firstByte"),
+    ("download", "timings.download"),
+    ("total", "timings.total"),
 ];
 
-/// Completions after `JSON.`
-pub const JSON_PROPS: &[(&str, &str)] = &[
-    ("parse", "JSON.parse(text)"),
-    ("stringify", "JSON.stringify(value, replacer?, space?)"),
-];
-
-/// Completions after `Math.`
-pub const MATH_PROPS: &[(&str, &str)] = &[
-    ("floor", "Math.floor(n)"),
-    ("ceil", "Math.ceil(n)"),
-    ("round", "Math.round(n)"),
-    ("random", "Math.random()"),
-    ("abs", "Math.abs(n)"),
-    ("max", "Math.max(…)"),
-    ("min", "Math.min(…)"),
-];
-
-/// Completions after `Object.`
-pub const OBJECT_PROPS: &[(&str, &str)] = &[
-    ("keys", "Object.keys(obj)"),
-    ("values", "Object.values(obj)"),
-    ("entries", "Object.entries(obj)"),
-    ("assign", "Object.assign(target, …sources)"),
-];
-
-/// Completions after `Array.`
-pub const ARRAY_PROPS: &[(&str, &str)] = &[
-    ("isArray", "Array.isArray(x)"),
-    ("from", "Array.from(iterable)"),
-    ("of", "Array.of(…)"),
-];
-
-/// Completions after `Date.`
-pub const DATE_PROPS: &[(&str, &str)] = &[
-    ("now", "Date.now()"),
-    ("parse", "Date.parse(dateString)"),
-];
-
-/// Common `require('…')` module names in httpyac scripts.
-pub const REQUIRE_MODULES: &[&str] = &[
-    "crypto",
-    "fs",
-    "path",
-    "url",
-    "querystring",
-    "buffer",
-    "util",
-    "assert",
-];
-
-/// `crypto.` — Node crypto (httpyac script VM). Not full tsserver; curated for common APIs.
-pub const CRYPTO_PROPS: &[(&str, &str)] = &[
-    ("createHmac", "crypto.createHmac(algorithm, key) → Hmac"),
-    ("createHash", "crypto.createHash(algorithm) → Hash"),
-    ("createSign", "crypto.createSign(algorithm) → Sign"),
-    ("createVerify", "crypto.createVerify(algorithm) → Verify"),
-    ("randomBytes", "crypto.randomBytes(size) → Buffer"),
-    ("randomUUID", "crypto.randomUUID() → string"),
-    ("pbkdf2", "crypto.pbkdf2(password, salt, iterations, keylen, digest, cb)"),
-    ("pbkdf2Sync", "crypto.pbkdf2Sync(…) → Buffer"),
-    ("scrypt", "crypto.scrypt(…)"),
-    ("scryptSync", "crypto.scryptSync(…) → Buffer"),
-    ("createCipheriv", "crypto.createCipheriv(algorithm, key, iv)"),
-    ("createDecipheriv", "crypto.createDecipheriv(algorithm, key, iv)"),
-    ("publicEncrypt", "crypto.publicEncrypt(key, buffer)"),
-    ("privateDecrypt", "crypto.privateDecrypt(key, buffer)"),
-    ("timingSafeEqual", "crypto.timingSafeEqual(a, b)"),
-    ("getHashes", "crypto.getHashes() → string[]"),
-    ("getCiphers", "crypto.getCiphers() → string[]"),
-    ("constants", "crypto.constants"),
-];
-
-/// After `createHmac(…).` / `createHash(…).` / `.update(…).` (fluent API through digest)
-pub const CRYPTO_HASH_CHAIN_PROPS: &[(&str, &str)] = &[
-    (
-        "update",
-        "hmac/hash.update(data, inputEncoding?) → this (chain; call again or .digest)",
-    ),
-    (
-        "digest",
-        "hmac/hash.digest('hex'|'base64'|…) → string | Buffer (end of chain)",
-    ),
-    ("copy", "hash.copy() → Hash (Hash only; copies state)"),
-];
-
-/// `digest('…` encoding arguments (Node crypto)
-pub const CRYPTO_DIGEST_ENCODINGS: &[&str] =
-    &["hex", "base64", "base64url", "latin1", "binary", "utf8"];
-
-/// Full one-shot snippets when picking createHmac / createHash from `crypto.`
-pub const CRYPTO_CREATE_HMAC_SNIPPET: &str =
-    "createHmac('${1:sha256}', ${2:'secret'})\n  .update(${3:data})\n  .digest('${4:base64}')";
-pub const CRYPTO_CREATE_HASH_SNIPPET: &str =
-    "createHash('${1:sha256}')\n  .update(${2:data})\n  .digest('${3:hex}')";
-/// After `).` prefer finishing with update→digest in one step
-pub const CRYPTO_UPDATE_THEN_DIGEST_SNIPPET: &str =
-    "update(${1:data}).digest('${2:base64}')";
-
-/// `fs.` common sync APIs used in scripts
-pub const FS_PROPS: &[(&str, &str)] = &[
-    ("readFileSync", "fs.readFileSync(path, encoding?)"),
-    ("writeFileSync", "fs.writeFileSync(path, data)"),
-    ("existsSync", "fs.existsSync(path)"),
-    ("readdirSync", "fs.readdirSync(path)"),
-    ("statSync", "fs.statSync(path)"),
-    ("mkdirSync", "fs.mkdirSync(path, opts?)"),
-    ("readFile", "fs.readFile(path, cb)"),
-    ("writeFile", "fs.writeFile(path, data, cb)"),
-];
-
-/// `path.`
-pub const PATH_PROPS: &[(&str, &str)] = &[
-    ("join", "path.join(…)"),
-    ("resolve", "path.resolve(…)"),
-    ("basename", "path.basename(p)"),
-    ("dirname", "path.dirname(p)"),
-    ("extname", "path.extname(p)"),
-    ("parse", "path.parse(p)"),
-    ("sep", "path.sep"),
-];
-
-/// `Buffer.` static
-pub const BUFFER_STATIC_PROPS: &[(&str, &str)] = &[
-    ("from", "Buffer.from(data, encoding?)"),
-    ("alloc", "Buffer.alloc(size)"),
-    ("allocUnsafe", "Buffer.allocUnsafe(size)"),
-    ("concat", "Buffer.concat(list)"),
-    ("isBuffer", "Buffer.isBuffer(obj)"),
-    ("byteLength", "Buffer.byteLength(string, encoding?)"),
-];
-
-/// `exports.` — httpyac pre-request script side-channel (then {{authDate}} etc.)
-pub const EXPORTS_NOTE: &str =
-    "httpyac pre-request: assign exports.NAME then use {{NAME}} in the request";
-
-/// Completions after `request.` (httpyac HttpRequest / Request)
+/// Completions after `request.` — httpyac `Request` / `HttpRequest`
+/// (`dist/models/httpRequest.d.ts`).
 pub const REQUEST_PROPS: &[(&str, &str)] = &[
     ("url", "Request URL (mutable in pre-request)"),
     ("method", "HTTP method"),
-    ("headers", "Request headers object (mutable in pre-request)"),
+    ("headers", "Request headers (Record; mutable in pre-request)"),
     ("body", "Request body"),
     ("contentType", "Parsed content-type"),
     ("protocol", "Protocol"),
@@ -365,55 +260,22 @@ pub const REQUEST_PROPS: &[(&str, &str)] = &[
     ("options", "Underlying got options (advanced)"),
 ];
 
-/// Completions after `client.` (IntelliJ-style + httpyac)
-pub const CLIENT_PROPS: &[(&str, &str)] = &[
-    ("global", "Persistent globals: set / get / clear / clearAll"),
-    ("test", "client.test(name, () => { … })"),
-    ("assert", "client.assert(condition, message?)"),
-    ("log", "client.log(…)"),
-    ("exit", "client.exit() — stop further requests (IntelliJ-style)"),
-    ("isInitial", "Whether this is the first request in a run"),
-];
-
-/// Completions after `client.global.`
-pub const CLIENT_GLOBAL_PROPS: &[(&str, &str)] = &[
-    ("set", "client.global.set(key, value)"),
-    ("get", "client.global.get(key)"),
-    ("isEmpty", "client.global.isEmpty()"),
-    ("clear", "client.global.clear(key?)"),
-    ("clearAll", "client.global.clearAll()"),
-];
-
-/// Top-level script globals from httpyac (besides request/response/client)
-pub const HTTPYAC_SCRIPT_GLOBALS: &[(&str, &str)] = &[
-    ("exports", "Pre-request: exports.NAME → {{NAME}} in request"),
-    ("$global", "Cross-request global store ($global.foo = …)"),
-    ("test", "test(name, () => { … }) — assert/chai helpers"),
-    ("sleep", "await sleep(ms)"),
-    ("httpFile", "Current http file model"),
-    ("httpRegion", "Current http region / request block"),
-    ("$requestClient", "Stream extra body on streaming requests"),
-    ("oauth2Session", "OAuth2 session when OpenID is used"),
-    ("__dirname", "Directory of current file"),
-    ("__filename", "Path of current file"),
-];
-
-/// Snippets for response / script blocks.
+/// Official-native script snippets (no IntelliJ `client.*`).
 pub const SCRIPT_SNIPPETS: &[(&str, &str, &str)] = &[
     (
-        "script-response-global",
-        "> {% client.global.set(…); %}",
-        "> {%\n  client.global.set(\"${1:name}\", response.parsedBody${2:});\n%}",
-    ),
-    (
-        "script-block",
-        "{{ client… }} response script",
-        "{{\n  client.test(\"${1:status 200}\", () => {\n    client.assert(response.statusCode === 200);\n  });\n  client.global.set(\"${2:var}\", response.parsedBody${3:});\n}}",
-    ),
-    (
         "script-test",
-        "client.test(…)",
-        "client.test(\"${1:name}\", () => {\n  client.assert(${2:response.statusCode === 200});\n});",
+        "test(…) with assert",
+        "test(\"${1:status 200}\", () => {\n  const { equal } = require('assert');\n  equal(response.statusCode, ${2:200});\n});",
+    ),
+    (
+        "script-global",
+        "$global.NAME = …",
+        "$global.${1:name} = ${2:response.parsedBody};",
+    ),
+    (
+        "script-sleep",
+        "await sleep(ms)",
+        "await sleep(${1:1000});",
     ),
 ];
 
@@ -581,99 +443,6 @@ pub fn in_script_context(lines: &[&str], line_idx: usize, before_cursor: &str) -
     }
 
     false
-}
-
-/// True if nearby script text looks like an open crypto Hash/Hmac/Sign fluent chain.
-fn crypto_fluent_window(lines: &[&str], line_idx: usize, before_cursor: &str) -> bool {
-    let start = line_idx.saturating_sub(8);
-    let mut window = String::new();
-    for i in start..line_idx {
-        window.push_str(lines.get(i).copied().unwrap_or(""));
-        window.push('\n');
-    }
-    window.push_str(before_cursor);
-    let w = window.as_str();
-    let starters = [
-        "createHmac",
-        "createHash",
-        "createSign",
-        "createVerify",
-        "createHmac(",
-        "createHash(",
-    ];
-    if !starters.iter().any(|s| w.contains(s)) {
-        return false;
-    }
-    // Still in chain if last digest(…) is not the final completed call at cursor,
-    // or user is typing another .member after ).
-    true
-}
-
-/// If cursor is on a crypto fluent chain (possibly multi-line), return the partial
-/// member name after the last `.` (may be empty right after `.`).
-///
-/// Handles:
-/// - `crypto.createHmac('sha256', key).`
-/// - `crypto.createHmac(...).update(data).`
-/// - newline + `.update` / `.digest`
-pub fn crypto_hash_chain_filter(
-    lines: &[&str],
-    line_idx: usize,
-    before_cursor: &str,
-) -> Option<String> {
-    if !crypto_fluent_window(lines, line_idx, before_cursor) {
-        return None;
-    }
-
-    // `...).partial` on same line
-    if let Some(idx) = before_cursor.rfind(").") {
-        let after = &before_cursor[idx + 2..];
-        if after.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Some(after.to_string());
-        }
-    }
-
-    // Multi-line: `  .partial` or `  .`
-    let trimmed = before_cursor.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('.') {
-        if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Some(rest.to_string());
-        }
-    }
-
-    // `foo.update(` still inside call — not member complete
-    None
-}
-
-/// Typing `digest('…` or `.digest("` — suggest encodings.
-pub fn crypto_digest_encoding_partial(before_cursor: &str) -> Option<String> {
-    // digest('  or digest("  or .digest('
-    let lower = before_cursor.to_ascii_lowercase();
-    let markers = [".digest(", "digest("];
-    let mut pos = None;
-    for m in markers {
-        if let Some(i) = lower.rfind(m) {
-            pos = Some(i + m.len());
-            break;
-        }
-    }
-    let pos = pos?;
-    let after = before_cursor[pos..].trim_start();
-    let (quote, rest) = if let Some(r) = after.strip_prefix('\'') {
-        ('\'', r)
-    } else if let Some(r) = after.strip_prefix('"') {
-        ('"', r)
-    } else {
-        return None;
-    };
-    if rest.contains(quote) {
-        return None;
-    }
-    Some(
-        rest.chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .collect(),
-    )
 }
 
 /// Build Zed-safe member completion fields.
@@ -927,6 +696,39 @@ mod dotted_prefix_tests {
         assert_eq!(
             dotted_prefix("crypto.createHmac('sha256', k)."),
             Some(("crypto.createHmac('sha256', k)".into(), "".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod official_globals_tests {
+    use super::{HTTPYAC_OFFICIAL_GLOBALS, SCRIPT_ROOTS};
+
+    #[test]
+    fn official_httpyac_global_names_match_script_roots() {
+        let official: Vec<_> = HTTPYAC_OFFICIAL_GLOBALS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        let roots: Vec<_> = SCRIPT_ROOTS.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(official.len(), 11);
+        assert_eq!(official, roots);
+        assert_eq!(
+            official,
+            vec![
+                "$global",
+                "$requestClient",
+                "httpFile",
+                "httpRegion",
+                "oauth2Session",
+                "request",
+                "response",
+                "sleep",
+                "test",
+                "__dirname",
+                "__filename",
+            ]
         );
     }
 }

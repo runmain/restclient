@@ -1,22 +1,13 @@
-//! Script completions from **builtin** + user `.script/` JS modules.
+//! Script completions: fallback httpyac catalog plus child-vtsls script types.
 //!
 //! ## Load order
 //!
-//! 1. **Builtin** (`lsp/builtin_script/*.js`, embedded via `include_str!`)
-//!    — `request`, `response`, `client`, `console`, `crypto`, …
+//! 1. **Official** structured props for `request` / `response` (from `completions.rs`,
+//!    aligned with httpyac `HttpRequest` / `HttpResponse` — not embedded JS files).
 //! 2. **User** project `.script/*.js` (walk parents from the `.http` file)
 //! 3. **User wins** on the same module path / member name (override).
 //!
-//! ## User convention
-//!
-//! ```text
-//! .script/
-//!   crypto.js             → overrides/extends builtin crypto
-//!   request.headers.js    → path extension request.headers.*
-//!   helpers.js            → new module helpers
-//! ```
-//!
-//! Any `.js` / `.mjs` / `.cjs` is heuristically parsed for exports / nested objects.
+//! Node/JS APIs (`crypto`, `fs`, …) are **not** seeded here — child vtsls covers them.
 //! Completions are **editor-only**. Runtime still uses httpyac + real `require()`.
 
 use std::collections::HashMap;
@@ -438,29 +429,63 @@ impl ScriptCatalog {
     }
 }
 
-/// Embedded builtin scripts (same format as user `.script/*.js`).
-const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
-    ("request.js", include_str!("../builtin_script/request.js")),
-    ("response.js", include_str!("../builtin_script/response.js")),
-    ("client.js", include_str!("../builtin_script/client.js")),
-    ("console.js", include_str!("../builtin_script/console.js")),
-    ("crypto.js", include_str!("../builtin_script/crypto.js")),
-    ("fs.js", include_str!("../builtin_script/fs.js")),
-    ("path.js", include_str!("../builtin_script/path.js")),
-    ("Buffer.js", include_str!("../builtin_script/Buffer.js")),
-    ("JSON.js", include_str!("../builtin_script/JSON.js")),
-    ("Math.js", include_str!("../builtin_script/Math.js")),
-    ("Object.js", include_str!("../builtin_script/Object.js")),
-    ("Array.js", include_str!("../builtin_script/Array.js")),
-    ("Date.js", include_str!("../builtin_script/Date.js")),
-    ("exports.js", include_str!("../builtin_script/exports.js")),
-    // Return-type shapes for chaining (const h = crypto.createHmac(); h.)
-    ("type.Hmac.js", include_str!("../builtin_script/type.Hmac.js")),
-    ("type.Hash.js", include_str!("../builtin_script/type.Hash.js")),
-    ("type.Sign.js", include_str!("../builtin_script/type.Sign.js")),
-    ("type.Verify.js", include_str!("../builtin_script/type.Verify.js")),
-    ("type.Buffer.js", include_str!("../builtin_script/type.Buffer.js")),
-];
+/// Seed fallback `request` / `response` member trees when child vtsls is unavailable.
+fn seed_official_httpyac_modules(catalog: &mut ScriptCatalog) {
+    use crate::completions::{REQUEST_PROPS, RESPONSE_PROPS, RESPONSE_TIMINGS_PROPS};
+
+    let mut request = MemberTree::default();
+    for (name, detail) in REQUEST_PROPS {
+        request.insert_path(
+            name,
+            ScriptMember {
+                name: (*name).to_string(),
+                detail: (*detail).to_string(),
+                documentation: format!(
+                    "[httpyac official] request.{name}\n{detail}\n\nSee https://httpyac.github.io/guide/scripting.html"
+                ),
+                insert: None,
+                is_method: false,
+                source: "httpyac:HttpRequest".into(),
+                returns: None,
+            },
+        );
+    }
+    catalog.modules.insert("request".into(), request);
+
+    let mut response = MemberTree::default();
+    for (name, detail) in RESPONSE_PROPS {
+        response.insert_path(
+            name,
+            ScriptMember {
+                name: (*name).to_string(),
+                detail: (*detail).to_string(),
+                documentation: format!(
+                    "[httpyac official] response.{name}\n{detail}\n\nSee https://httpyac.github.io/guide/scripting.html"
+                ),
+                insert: None,
+                is_method: false,
+                source: "httpyac:HttpResponse".into(),
+                returns: None,
+            },
+        );
+    }
+    // Nested timings.*
+    for (name, detail) in RESPONSE_TIMINGS_PROPS {
+        response.insert_path(
+            &format!("timings.{name}"),
+            ScriptMember {
+                name: (*name).to_string(),
+                detail: (*detail).to_string(),
+                documentation: format!("[httpyac official] response.timings.{name}"),
+                insert: None,
+                is_method: false,
+                source: "httpyac:HttpTimings".into(),
+                returns: None,
+            },
+        );
+    }
+    catalog.modules.insert("response".into(), response);
+}
 
 fn is_primitive_type(t: &str) -> bool {
     let t = t.trim();
@@ -919,17 +944,15 @@ fn ingest_js_source(catalog: &mut ScriptCatalog, file_name: &str, content: &str,
     }
 }
 
-/// Builtin catalog only (always available).
+/// Official httpyac request/response catalog (always available). No Node modules.
 pub fn load_builtin_catalog() -> ScriptCatalog {
     let mut catalog = ScriptCatalog {
-        dir: PathBuf::from("builtin_script"),
+        dir: PathBuf::from("httpyac_official"),
         modules: HashMap::new(),
         path_extensions: HashMap::new(),
         types: HashMap::new(),
     };
-    for (name, src) in BUILTIN_SCRIPTS {
-        ingest_js_source(&mut catalog, name, src, false);
-    }
+    seed_official_httpyac_modules(&mut catalog);
     catalog
 }
 
@@ -2659,14 +2682,10 @@ pub fn script_window_text(lines: &[&str], line_idx: usize) -> String {
 
 /// Builtin module id → static props table name mapping used by main.
 pub fn builtin_module_props(module: &str) -> Option<&'static [(&'static str, &'static str)]> {
-    use crate::completions::{
-        BUFFER_STATIC_PROPS, CRYPTO_PROPS, FS_PROPS, PATH_PROPS,
-    };
+    use crate::completions::{REQUEST_PROPS, RESPONSE_PROPS};
     match module {
-        "crypto" => Some(CRYPTO_PROPS),
-        "fs" => Some(FS_PROPS),
-        "path" => Some(PATH_PROPS),
-        "buffer" | "Buffer" => Some(BUFFER_STATIC_PROPS),
+        "request" => Some(REQUEST_PROPS),
+        "response" => Some(RESPONSE_PROPS),
         _ => None,
     }
 }
@@ -3430,10 +3449,26 @@ mod tests {
         assert_eq!(am.get("go"), Some(&true));
 
         // --- 4) End-to-end: require + call result members (single chain + mixed) ---
-        let mut cat = load_builtin_catalog();
+        // Named types come from user `.script/` (or required files), not Node builtins.
         let dir = std::env::temp_dir().join(format!("httpyac-matrix-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let script_dir = dir.join(".script");
+        fs::create_dir_all(&script_dir).unwrap();
+        fs::write(
+            script_dir.join("type.Hmac.js"),
+            r#"
+              /**
+               * @httpyac-type Hmac
+               */
+              module.exports = {
+                /** @returns {Hmac} */
+                update(data) {},
+                /** @returns {string} */
+                digest(encoding) {},
+              };
+            "#,
+        )
+        .unwrap();
         fs::write(
             dir.join("kit.js"),
             r#"
@@ -3446,6 +3481,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        let mut cat = build_catalog(Some(&script_dir));
         let text = r#"
           const { hmac, session } = require('./kit.js');
           const h = hmac();
@@ -3867,20 +3903,27 @@ mod builtin_and_override_tests {
     use std::io::Write;
 
     #[test]
-    fn builtin_has_request_response_client_console() {
+    fn builtin_has_official_request_response_only() {
         let cat = load_builtin_catalog();
-        for name in ["request", "response", "client", "console", "crypto"] {
-            assert!(cat.modules.contains_key(name), "missing builtin {name}");
+        for name in ["request", "response"] {
+            assert!(cat.modules.contains_key(name), "missing official {name}");
+        }
+        // Node / IntelliJ extras must NOT be seeded (vtsls owns Node)
+        for name in ["client", "console", "crypto", "fs", "path", "Buffer", "JSON"] {
+            assert!(
+                !cat.modules.contains_key(name),
+                "unexpected non-official builtin {name}"
+            );
         }
         let req = cat.members_for_path("request");
         assert!(req.iter().any(|m| m.name == "url"));
         assert!(req.iter().any(|m| m.name == "headers"));
-        let rh = cat.members_for_path("response.headers");
-        assert!(rh.iter().any(|m| m.name == "get") || rh.iter().any(|m| m.name == "valueOf"));
-        let cg = cat.members_for_path("client.global");
-        assert!(cg.iter().any(|m| m.name == "set"));
-        let cry = cat.members_for_path("crypto");
-        assert!(cry.iter().any(|m| m.name == "createHmac"));
+        let resp = cat.members_for_path("response");
+        assert!(resp.iter().any(|m| m.name == "statusCode"));
+        assert!(!resp.iter().any(|m| m.name == "status")); // no IntelliJ alias
+        assert!(!resp.iter().any(|m| m.name == "responseTime"));
+        let timings = cat.members_for_path("response.timings");
+        assert!(timings.iter().any(|m| m.name == "total"));
     }
 
     #[test]
@@ -3918,7 +3961,8 @@ mod builtin_and_override_tests {
         let mut cache = ScriptCatalogCache::default();
         let cat = cache.get_or_load(Path::new("/tmp/no-such-httpyac-project-xyz"));
         assert!(cat.modules.contains_key("request"));
-        assert!(cat.modules.contains_key("crypto"));
+        assert!(cat.modules.contains_key("response"));
+        assert!(!cat.modules.contains_key("crypto"));
     }
 
     #[test]
@@ -3934,75 +3978,8 @@ mod builtin_and_override_tests {
         assert_eq!(resolve_path_with_bindings("crypto", &b), "crypto");
     }
 
-    #[test]
-    fn returns_annotation_and_hmac_chain() {
-        let cat = load_builtin_catalog();
-        assert!(cat.types.contains_key("Hmac"), "Hmac type missing");
-        let cry = cat.members_for_path("crypto");
-        let create = cry.iter().find(|m| m.name == "createHmac");
-        assert!(create.is_some());
-        assert_eq!(
-            create.and_then(|m| m.returns.as_deref()),
-            Some("Hmac"),
-            "createHmac should @returns Hmac"
-        );
-        assert_eq!(
-            cat.returns_of_path("crypto.createHmac").as_deref(),
-            Some("Hmac")
-        );
-        let hmac_mem = cat.members_for_type("Hmac", "");
-        assert!(hmac_mem.iter().any(|m| m.name == "update"));
-        assert!(hmac_mem.iter().any(|m| m.name == "digest"));
-    }
 
-    #[test]
-    fn infer_const_hmac_binding() {
-        let mut cat = load_builtin_catalog();
-        let text = r#"
-          const crypto = require('crypto');
-          const h = crypto.createHmac('sha256', 'secret');
-          const h2 = h.update('data');
-        "#;
-        let req = parse_require_bindings(text);
-        let vars = parse_typed_bindings(text, &mut cat, &req);
-        assert_eq!(vars.get("h").map(|s| s.as_str()), Some("Hmac"));
-        assert_eq!(vars.get("h2").map(|s| s.as_str()), Some("Hmac"));
-        match resolve_completion_path("h", &cat, &req, &vars) {
-            PathResolve::Type { type_name, rest } => {
-                assert_eq!(type_name, "Hmac");
-                assert!(rest.is_empty());
-            }
-            other => panic!("expected Type, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn user_crypto_override_keeps_createhmac_returns() {
-        let dir = std::env::temp_dir().join(format!(
-            "httpyac-crypto-override-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        // User overrides createHmac WITHOUT @returns — must still chain via preserve/fallback
-        fs::write(
-            dir.join("crypto.js"),
-            r#"module.exports = { createHmac(a,k) { return {}; }, sign() {} };"#,
-        )
-        .unwrap();
-        let mut cat = build_catalog(Some(&dir));
-        assert_eq!(
-            cat.returns_of_path("crypto.createHmac").as_deref(),
-            Some("Hmac")
-        );
-        let text = "const crypto = require('crypto');\nconst sha256 = crypto.createHmac('sha256', 'secret');\n";
-        let req = parse_require_bindings(text);
-        let vars = parse_typed_bindings(text, &mut cat, &req);
-        assert_eq!(vars.get("sha256").map(|s| s.as_str()), Some("Hmac"));
-        let mem = cat.members_for_type("Hmac", "");
-        assert!(mem.iter().any(|m| m.name == "update"));
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn hostile_script_does_not_abort_catalog() {
@@ -4022,10 +3999,10 @@ mod builtin_and_override_tests {
         let cat = build_catalog(Some(&dir));
         assert!(
             cat.modules.contains_key("request"),
-            "builtins must still load"
+            "official request must still load"
         );
         assert!(
-            cat.modules.contains_key("ok") || cat.modules.contains_key("crypto"),
+            cat.modules.contains_key("ok") || cat.modules.contains_key("response"),
             "catalog still usable after hostile file"
         );
         let _ = fs::remove_dir_all(&dir);

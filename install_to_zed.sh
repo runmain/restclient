@@ -1,27 +1,59 @@
 #!/usr/bin/env bash
-# 编译并安装 HTTPyac Client 扩展到 Zed（macOS + Linux）
+# Build and install the HTTPyac Client extension for Zed (macOS + Linux)
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+PROJECT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 cd "$PROJECT_DIR"
 
-# 安装结果标记（用于最终结论）
+if [[ -z "${HOME:-}" ]]; then
+  echo "ERROR: HOME is not set; unable to determine the Zed and local binary installation directories."
+  exit 2
+fi
+
+# In containers, explicitly target host-mounted directories for the system and architecture running Zed.
+ZED_EXT_DIR_OVERRIDE="${ZED_EXT_DIR:-}"
+LOCAL_BIN_OVERRIDE="${HTTPYAC_LOCAL_BIN:-}"
+INSTALL_DIR=""
+INSTALL_STAGE=""
+INSTALL_BACKUP=""
+GRAMMAR_TMP=""
+
+cleanup_install() {
+  if [[ -n "${INSTALL_STAGE:-}" && -d "$INSTALL_STAGE" ]]; then
+    rm -rf "$INSTALL_STAGE"
+  fi
+  if [[ -n "${INSTALL_BACKUP:-}" && -d "$INSTALL_BACKUP" && -n "${INSTALL_DIR:-}" && ! -e "$INSTALL_DIR" ]]; then
+    mv "$INSTALL_BACKUP" "$INSTALL_DIR" || true
+  fi
+  if [[ -n "${GRAMMAR_TMP:-}" && -d "$GRAMMAR_TMP" ]]; then
+    rm -rf "$GRAMMAR_TMP"
+  fi
+}
+trap cleanup_install EXIT
+
+# Installation status flags for the final summary.
 OK_LSP=0
 OK_WASM=0
 OK_GRAMMAR=0
 OK_EXT=0
 OK_HTTPYAC=0
 OK_VTSLS=0
-OK_SETTINGS="跳过"
+OK_SETTINGS="Skipped"
 VTSLS_PATH="vtsls"
 HTTPYAC_PATH="httpyac"
 LSP_PATH=""
 WARNINGS=()
-# 需要用户手动操作的条目（最终「必做/选做」清单）
-MANUAL_REQUIRED=()   # 不处理可能影响使用
-MANUAL_OPTIONAL=()   # 可选优化
+# User actions shown in the final required/optional checklist.
+MANUAL_REQUIRED=()   # Skipping these may affect functionality.
+MANUAL_OPTIONAL=()   # Optional improvements.
 
-# 终端颜色（非 TTY 时关闭，避免日志乱码）
+# Disable terminal colors when stdout is not a TTY.
 if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
   C_RESET=$'\033[0m'
   C_BOLD=$'\033[1m'
@@ -31,98 +63,79 @@ if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
   C_GRN=$'\033[1;32m'
   C_CYN=$'\033[1;36m'
   C_MAG=$'\033[1;35m'
-  C_BG_YEL=$'\033[1;30;43m'   # 黑字黄底 — 注意/请复制
-  C_BG_RED=$'\033[1;37;41m'   # 白字红底 — 必做
-  C_BG_CYN=$'\033[1;30;46m'   # 黑字青底 — 选做/提示
+  C_BG_YEL=$'\033[1;30;43m'   # Black text on yellow: attention or copy block.
+  C_BG_RED=$'\033[1;37;41m'   # White text on red: required action.
+  C_BG_CYN=$'\033[1;30;46m'   # Black text on cyan: optional action or note.
 else
   C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_YEL="" C_GRN="" C_CYN="" C_MAG=""
   C_BG_YEL="" C_BG_RED="" C_BG_CYN=""
 fi
 
-# 高亮「需要注意」一行条幅
-print_attention() {
-  # 用法: print_attention "标题文字"
-  echo ""
-  echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo "${C_BG_YEL}!!  ⚠ 注意：$*${C_RESET}"
-  echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo ""
-}
-
-# 高亮「需要你手动操作」区块
+# Highlight a required manual action.
 print_manual_box() {
   local title="$1"
   shift
   echo ""
-  echo "${C_BG_RED}████████████████████████████████████████████████████████████████${C_RESET}"
-  echo "${C_BG_RED}██  ✋ 需要你手动操作（请仔细看）                              ██${C_RESET}"
-  echo "${C_BG_RED}████████████████████████████████████████████████████████████████${C_RESET}"
+  echo "${C_BG_RED}+----------------------------------------------------------------+${C_RESET}"
+  echo "${C_BG_RED}| Manual action required (read carefully)                        |${C_RESET}"
+  echo "${C_BG_RED}+----------------------------------------------------------------+${C_RESET}"
   echo "${C_YEL}${C_BOLD}>>> $title${C_RESET}"
-  echo "${C_YEL}────────────────────────────────────────────────────────────────${C_RESET}"
+  echo "${C_YEL}------------------------------------------------------------------${C_RESET}"
   while [[ $# -gt 0 ]]; do
     if [[ -z "$1" ]]; then
       echo ""
     else
-      echo "${C_YEL}  ▸ ${C_RESET}$1"
+      echo "${C_YEL}  - ${C_RESET}$1"
     fi
     shift
   done
-  echo "${C_YEL}────────────────────────────────────────────────────────────────${C_RESET}"
+  echo "${C_YEL}------------------------------------------------------------------${C_RESET}"
   echo ""
 }
 
-# 高亮「请复制以下内容」— 最显眼的一块
+# Highlight the settings block to copy.
 print_manual_json_block() {
   local settings_path="$1"
   echo ""
   echo "${C_BG_YEL}********************************************************************${C_RESET}"
-  echo "${C_BG_YEL}**  ★★★  请复制以下内容（整段粘贴/合并到 settings.json）  ★★★  **${C_RESET}"
+  echo "${C_BG_YEL}**   Copy this entire block into settings.json (merge it)       **${C_RESET}"
   echo "${C_BG_YEL}********************************************************************${C_RESET}"
   echo ""
-  echo "${C_CYN}${C_BOLD}  【目标文件】${C_RESET}"
+  echo "${C_CYN}${C_BOLD}  Target file${C_RESET}"
   echo "    ${C_BOLD}$settings_path${C_RESET}"
   echo ""
-  echo "${C_CYN}${C_BOLD}  【怎么做】${C_RESET}"
-  echo "    1. 用编辑器打开上面的 settings.json"
-  echo "    2. 在最外层 { ... } 里 ${C_YEL}${C_BOLD}合并${C_RESET} 下面字段（不要重复同名 key）"
-  echo "    3. 注意 JSON ${C_YEL}逗号${C_RESET}；${C_GRN}保留${C_RESET} 你原来的其它配置和注释"
+  echo "${C_CYN}${C_BOLD}  Steps${C_RESET}"
+  echo "    1. Open the settings.json file above in an editor."
+  echo "    2. ${C_YEL}${C_BOLD}Merge${C_RESET} the fields below into the top-level { ... } object without duplicate keys."
+  echo "    3. Preserve JSON ${C_YEL}commas${C_RESET} and ${C_GRN}keep${C_RESET} your existing settings and comments."
   echo ""
-  echo "${C_BG_YEL}>>>>>>>>>>  从下一行开始复制  >>>>>>>>>>${C_RESET}"
-  echo "${C_DIM}# ----- COPY START（Zed settings 支持 // 注释；自动写入时会剥掉注释） -----${C_RESET}"
+  echo "${C_BG_YEL}>>>>>>>>>>  COPY FROM THE NEXT LINE  >>>>>>>>>>${C_RESET}"
+  echo "${C_DIM}# ----- COPY START (Zed settings support // comments; automatic writes remove them) -----${C_RESET}"
   cat <<EOF
-  // ── httpyac 扩展相关（路径类：填绝对路径字符串）────────────────
+  // httpyac extension settings (use absolute paths for path values)
   "httpyac": {
-    // command: httpyac CLI 可执行文件路径 | 或 PATH 里的命令名 "httpyac"
+    // command: httpyac CLI executable path or the command name "httpyac" in PATH
     "command": "$HTTPYAC_PATH",
-    // lsp_command: httpyac-lsp 路径 | 一般 ~/.local/bin/httpyac-lsp
+    // lsp_command: httpyac-lsp path, usually ~/.local/bin/httpyac-lsp
     "lsp_command": "$LSP_PATH",
-    // vtsls_command: child vtsls 路径（仅 script 引擎=vtsls 时用）| "vtsls" | which vtsls
+    // vtsls_command: child vtsls path for script blocks and official model completions, or "vtsls"
     "vtsls_command": "$VTSLS_PATH",
-    // use_builtin_script_completions: true=内置 catalog | false=只用 child vtsls（与 vtsls 互斥）
-    "use_builtin_script_completions": true,
-    // default_env: 文档/默认名字符串（如 "dev"|"prod"|"test"）；真正发请求以 env JSON 的 activeEnv 为准
+    // Child vtsls provides official models and Node/JS completions in script blocks.
+    // default_env: a display/default environment name such as "dev", "prod", or "test"; requests use activeEnv from env JSON.
     "default_env": "dev"
   },
   "lsp": {
     "httpyac-lsp": {
       "binary": {
-        // path: Zed 启动 LSP 的绝对路径
+        // path: absolute path used by Zed to start the LSP
         "path": "$LSP_PATH",
-        // arguments: 传给 httpyac-lsp 的额外参数数组，通常 []
+        // arguments: additional arguments passed to httpyac-lsp, usually []
         "arguments": []
       },
       "settings": {
-        // vtslsCommand: 同 httpyac.vtsls_command（LSP 优先读这里）
-        "vtslsCommand": "$VTSLS_PATH",
-        // vtslsEnabled: true=允许拉起 vtsls | false=强制走 builtin（即使 source 写成 vtsls）
-        "vtslsEnabled": true,
-        // useBuiltinScriptCompletions: true= {{}} 只用内置 catalog | false=只用 child vtsls（互斥，不能两个一起）
-        // 有 vtsls 时默认 false=纯 vtsls（shadow+jsconfig+@types/node）；无 vtsls 时 true
-        "useBuiltinScriptCompletions": false,
-        // scriptCompletionSource: "builtin"|"catalog"|"httpyac" = 内置
-        //                         "vtsls"|"ts"|"typescript" = child vtsls
-        // （与 useBuiltinScriptCompletions 二选一写法，效果相同）
-        "scriptCompletionSource": "vtsls"
+        // vtslsCommand: same as httpyac.vtsls_command; the LSP reads this first
+        // Child vtsls provides official models and Node/JS completions in script blocks.
+        "vtslsCommand": "$VTSLS_PATH"
       }
     }
   },
@@ -130,58 +143,52 @@ print_manual_json_block() {
     "HTTP": {
       // enable_language_server: true | false
       "enable_language_server": true,
-      // language_servers: 只能 ["httpyac-lsp"] — 不要加 "vtsls"（整文件当 TS 会炸）
+      // language_servers: use only ["httpyac-lsp"]; do not add "vtsls" because it treats the full file as TypeScript
       "language_servers": ["httpyac-lsp"],
       "completions": {
-        // lsp: true=用 LSP 补全 | false=关闭
+        // lsp: true enables LSP completions; false disables them
         "lsp": true,
-        // words: "disabled"=不要单词补全 | "fallback"=LSP 无结果时再用单词 | "enabled"=总开
-        // （推荐 fallback 或 disabled，避免 Hello 盖住 Host）
+        // words: "disabled" disables word completions; "fallback" uses words only when LSP has no result; "enabled" always uses words
+        // Use fallback or disabled to prevent "Hello" from hiding "Host".
         "words": "disabled"
-        // 可选 words_min_length: 数字 ≥1，单词补全最小长度，常用 3
+        // Optional words_min_length: integer >= 1, with 3 as a common value
       }
     }
   }
 EOF
   echo "${C_DIM}# ----- COPY END -----${C_RESET}"
-  echo "${C_BG_YEL}<<<<<<<<<<  复制到上一行结束  <<<<<<<<<<${C_RESET}"
+  echo "${C_BG_YEL}<<<<<<<<<<  COPY THROUGH THE PREVIOUS LINE  <<<<<<<<<<${C_RESET}"
   echo ""
-  echo "${C_CYN}${C_BOLD}  【配置项可选值速查】${C_RESET}"
-  echo "    ${C_BOLD}script 补全引擎（{{}} 内互斥，只生效一个）${C_RESET}"
-  echo "      useBuiltinScriptCompletions / use_builtin_script_completions"
-  echo "        → ${C_GRN}true${C_RESET}  = 内置 catalog（@returns / .script / require 形状）  ${C_DIM}【默认】${C_RESET}"
-  echo "        → ${C_YEL}false${C_RESET} = child vtsls（需 npm i -g @vtsls/language-server）"
-  echo "      scriptCompletionSource"
-  echo "        → ${C_GRN}\"builtin\"${C_RESET} | \"catalog\" | \"httpyac\"     = 同上内置"
-  echo "        → ${C_YEL}\"vtsls\"${C_RESET}   | \"ts\" | \"typescript\" = 同上 vtsls"
-  echo "      vtslsEnabled"
-  echo "        → ${C_GRN}true${C_RESET}  = 允许启动 vtsls（当 source=vtsls 时）"
-  echo "        → ${C_YEL}false${C_RESET} = 强制 builtin"
-  echo "    ${C_BOLD}路径类（字符串）${C_RESET}"
+  echo "${C_CYN}${C_BOLD}  Configuration reference${C_RESET}"
+  echo "    ${C_BOLD}Script completions (always mixed inside {{}})${C_RESET}"
+  echo "      Child vtsls provides official httpyac globals and Node/JS script completions."
+  echo "      vtslsCommand / httpyac.vtsls_command"
+  echo "        -> absolute vtsls path or its command name in PATH ${C_DIM}(required for script completions)${C_RESET}"
+  echo "    ${C_BOLD}Path values (strings)${C_RESET}"
   echo "      httpyac.command / lsp_command / vtsls_command / lsp.httpyac-lsp.binary.path"
-  echo "        → 绝对路径，或 PATH 中的命令名"
-  echo "    ${C_BOLD}HTTP 语言${C_RESET}"
-  echo "      language_servers → 仅 ${C_GRN}[\"httpyac-lsp\"]${C_RESET}（禁止加 vtsls）"
-  echo "      completions.words → ${C_GRN}\"disabled\"${C_RESET} | \"fallback\" | \"enabled\""
-  echo "      completions.lsp   → true | false"
-  echo "      default_env       → 任意环境名字符串（dev/prod/…）"
+  echo "        -> absolute path or its command name in PATH"
+  echo "    ${C_BOLD}HTTP language${C_RESET}"
+  echo "      language_servers -> only ${C_GRN}[\"httpyac-lsp\"]${C_RESET} (do not add vtsls)"
+  echo "      completions.words -> ${C_GRN}\"disabled\"${C_RESET} | \"fallback\" | \"enabled\""
+  echo "      completions.lsp   -> true | false"
+  echo "      default_env       -> any environment name string (dev/prod/etc.)"
   echo ""
-  echo "${C_MAG}${C_BOLD}  【不想手改？】${C_RESET}可强制自动写入（${C_RED}会丢掉 // 注释${C_RESET}，会先备份）："
+  echo "${C_MAG}${C_BOLD}  Prefer not to edit manually?${C_RESET} Force an automatic write (${C_RED}// comments will be removed${C_RESET}; a backup is created):"
   echo "    ${C_BOLD}FORCE_ZED_SETTINGS=1 $0${C_RESET}"
   echo ""
 }
 
 # ---------------------------------------------------------------------------
-# 路径探测（不写死机器路径）
+# Detect platform-specific paths without hard-coded machine paths.
 # ---------------------------------------------------------------------------
 detect_os_paths() {
   local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 
   if [[ "${OSTYPE:-}" == darwin* ]]; then
     IS_MACOS=1
-    # 扩展：macOS 仍在 Application Support
-    ZED_EXT_DIR="${HOME}/Library/Application Support/Zed/extensions/installed"
-    # 设置：优先 ~/.config/zed/settings.json（当前 Zed 默认）
+    # Extensions remain under Application Support on macOS.
+    ZED_EXT_DIR="${ZED_EXT_DIR_OVERRIDE:-${HOME}/Library/Application Support/Zed/extensions/installed}"
+    # Prefer ~/.config/zed/settings.json, the current Zed default.
     local mac_settings_xdg="${config_home}/zed/settings.json"
     local mac_settings_app="${HOME}/Library/Application Support/Zed/settings.json"
     if [[ -f "$mac_settings_xdg" ]]; then
@@ -193,67 +200,107 @@ detect_os_paths() {
     fi
   else
     IS_MACOS=0
-    ZED_EXT_DIR="${config_home}/zed/extensions/installed"
-    if [[ ! -d "$ZED_EXT_DIR" && -d "${config_home}/zed/extensions" ]]; then
-      ZED_EXT_DIR="${config_home}/zed/extensions"
+    local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local zed_data_ext="${data_home}/zed/extensions/installed"
+    local zed_legacy_ext="${config_home}/zed/extensions/installed"
+    if [[ -n "$ZED_EXT_DIR_OVERRIDE" ]]; then
+      ZED_EXT_DIR="$ZED_EXT_DIR_OVERRIDE"
+    elif [[ -d "$zed_data_ext" || ! -d "$zed_legacy_ext" ]]; then
+      ZED_EXT_DIR="$zed_data_ext"
+    else
+      # Preserve the legacy config-directory installation when it already exists.
+      ZED_EXT_DIR="$zed_legacy_ext"
     fi
     ZED_SETTINGS="${config_home}/zed/settings.json"
   fi
 
-  LOCAL_BIN="${HOME}/.local/bin"
+  LOCAL_BIN="${LOCAL_BIN_OVERRIDE:-${HOME}/.local/bin}"
+}
+
+is_container() {
+  [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]] || \
+    { [[ -r /proc/1/cgroup ]] && grep -qaE '(docker|containerd|kubepods|podman)' /proc/1/cgroup; }
+}
+
+require_command() {
+  local command_name="$1"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "ERROR: Missing required command: $command_name"
+    exit 2
+  fi
+}
+
+sign_macos_binary() {
+  local binary_path="$1"
+  if ! codesign --force --sign - "$binary_path" >/dev/null 2>&1; then
+    echo "  WARNING: codesign failed: $binary_path"
+    WARNINGS+=("macOS signing failed: $binary_path")
+  fi
 }
 
 echo "=========================================="
-echo " HTTPyac Client — 编译并安装到 Zed"
+echo " HTTPyac Client - Build and Install for Zed"
 echo "=========================================="
 echo ""
 
 detect_os_paths
-echo "【路径】"
-echo "  扩展目录   → $ZED_EXT_DIR"
-echo "  配置文件   → $ZED_SETTINGS"
-echo "  本地 bin   → $LOCAL_BIN"
+if is_container && { [[ -z "$ZED_EXT_DIR_OVERRIDE" ]] || [[ -z "$LOCAL_BIN_OVERRIDE" ]]; }; then
+  print_manual_box "Container installations must explicitly specify host-mounted directories" \
+    "The default HOME writes only inside the container, so the host Zed and Send task cannot use those files." \
+    "Run this only when the container and the Zed host use the same operating system and CPU architecture:" \
+    "  ZED_EXT_DIR=/mounted/Zed/extensions/installed HTTPYAC_LOCAL_BIN=/mounted/local/bin ./install_to_zed.sh" \
+    "A macOS host cannot use Linux Docker artifacts; run this script directly on the macOS host."
+  exit 2
+fi
+echo "Paths"
+echo "  Extension directory: $ZED_EXT_DIR"
+echo "  Settings file:       $ZED_SETTINGS"
+echo "  Local bin directory: $LOCAL_BIN"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1) 编译 httpyac-lsp
+# 1) Build httpyac-lsp.
 # ---------------------------------------------------------------------------
-echo "【1/7】编译 httpyac-lsp + httpyac-run（Release）..."
+require_command cargo
+require_command rustup
+
+echo "[1/7] Build httpyac-lsp + httpyac-run (release)..."
 if (cd lsp && cargo build --release); then
-  mkdir -p target/release
-  cp lsp/target/release/httpyac-lsp target/release/
-  cp lsp/target/release/httpyac-run target/release/
-  echo "  ✅ httpyac-lsp 编译成功"
-  echo "  ✅ httpyac-run 编译成功（发送/选环境入口）"
+  echo "  OK: httpyac-lsp built successfully"
+  echo "  OK: httpyac-run built successfully (Send and environment selector entry point)"
   OK_LSP=1
 else
-  echo "  ❌ LSP/run 编译失败"
+  echo "  ERROR: LSP/task runner build failed"
   exit 1
 fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 2) 编译 WASM 扩展（必须是 Component Model，目标 wasm32-wasip2）
-#    Zed 用 component parser 加载 extension.wasm；wasip1 产物是 MVP 模块，会报：
+# 2) Build the WASM extension as a Component Model target (wasm32-wasip2).
+#    Zed loads extension.wasm with a component parser; wasip1 output is an MVP module and causes:
 #    "attempted to parse a wasm module with a component parser"
-#    → 扩展加载失败 → httpyac-lsp 永不启动 → 只有 buffer 单词补全（Hello 等）
+#    -> extension load failure -> httpyac-lsp never starts -> only buffer-word completions such as "Hello"
 # ---------------------------------------------------------------------------
-echo "【2/7】安装 wasm32-wasip2 目标（如需要）..."
-rustup target add wasm32-wasip2 >/dev/null 2>&1 || true
+echo "[2/7] Install the wasm32-wasip2 target if needed..."
+if ! rustup target list --installed | grep -qx 'wasm32-wasip2'; then
+  if ! rustup target add wasm32-wasip2; then
+    echo "  ERROR: Unable to install wasm32-wasip2; check the rustup mirror, network, and toolchain."
+    exit 1
+  fi
+fi
 
-echo "【3/7】编译 WASM 扩展（wasm32-wasip2 component）..."
+echo "[3/7] Build the WASM extension (wasm32-wasip2 component)..."
 if cargo build --release --target wasm32-wasip2; then
   :
 else
-  echo "  ❌ WASM 扩展编译失败"
+  echo "  ERROR: WASM extension build failed"
   exit 1
 fi
 
 WASM_SRC=""
 for candidate in \
   "target/wasm32-wasip2/release/zed_httpyacclient.wasm" \
-  "target/wasm32-wasip2/release/httpyacclient.wasm" \
-  "target/wasm32-wasip1/release/zed_httpyacclient.wasm"
+  "target/wasm32-wasip2/release/httpyacclient.wasm"
 do
   if [[ -f "$candidate" ]]; then
     WASM_SRC="$candidate"
@@ -262,38 +309,40 @@ do
 done
 
 if [[ -z "$WASM_SRC" ]]; then
-  echo "  ❌ 未找到 WASM 产物（期望 zed_httpyacclient.wasm）"
+  echo "  ERROR: WASM artifact not found (expected zed_httpyacclient.wasm)"
   ls -la target/wasm32-wasip2/release/ 2>/dev/null || true
   exit 1
 fi
 
 cp "$WASM_SRC" extension.wasm
 
-# 校验：Zed 需要 WebAssembly Component（file 显示 version 0x1000d），不是 MVP 0x1
+# Validate the WebAssembly Component required by Zed (file shows version 0x1000d), not MVP 0x1.
 WASM_FILE_INFO="$(file extension.wasm 2>/dev/null || true)"
 if echo "$WASM_FILE_INFO" | grep -q "0x1 (MVP)"; then
-  echo "  ❌ extension.wasm 仍是 MVP 模块，不是 Component："
+  echo "  ERROR: extension.wasm is still an MVP module, not a Component:"
   echo "     $WASM_FILE_INFO"
-  echo "     请使用 rustc/cargo 较新版本，并确保 --target wasm32-wasip2"
+  echo "     Use a newer rustc/cargo version and ensure --target wasm32-wasip2 is set."
   exit 1
 fi
 if echo "$WASM_FILE_INFO" | grep -qE "0x1000d|component"; then
-  echo "  ✅ extension.wasm 为 Component ← $WASM_SRC ($(du -h extension.wasm | awk '{print $1}'))"
+  echo "  OK: extension.wasm is a Component <- $WASM_SRC ($(du -h extension.wasm | awk '{print $1}'))"
 else
-  echo "  ⚠ 无法用 file(1) 确认 component 格式，继续安装："
+  echo "  WARNING: file(1) could not confirm the component format; continuing installation:"
   echo "     $WASM_FILE_INFO"
-  echo "  ✅ extension.wasm ← $WASM_SRC ($(du -h extension.wasm | awk '{print $1}'))"
+  echo "  OK: extension.wasm <- $WASM_SRC ($(du -h extension.wasm | awk '{print $1}'))"
 fi
 OK_WASM=1
 echo ""
 # ---------------------------------------------------------------------------
-# 3) 语法文件
+# 3) Grammar file.
 # ---------------------------------------------------------------------------
-echo "【4/7】检查 tree-sitter 语法..."
+echo "[4/7] Check the tree-sitter grammar..."
 if [[ ! -f grammars/http.wasm ]]; then
-  echo "  正在编译 grammars/http.wasm ..."
+  echo "  Building grammars/http.wasm..."
+  require_command git
+  require_command npm
   if ! command -v tree-sitter >/dev/null 2>&1; then
-    echo "  通过 npm 安装 tree-sitter-cli..."
+    echo "  Installing tree-sitter-cli with npm..."
     npm install -g tree-sitter-cli
   fi
   GRAMMAR_TMP="$(mktemp -d)"
@@ -302,80 +351,107 @@ if [[ ! -f grammars/http.wasm ]]; then
   mkdir -p grammars
   cp "$GRAMMAR_TMP/tree-sitter-http/http.wasm" grammars/http.wasm
   rm -rf "$GRAMMAR_TMP"
-  echo "  ✅ grammars/http.wasm 已生成"
+  GRAMMAR_TMP=""
+  echo "  OK: grammars/http.wasm generated"
 else
-  echo "  ✅ grammars/http.wasm 已存在"
+  echo "  OK: grammars/http.wasm already exists"
 fi
 OK_GRAMMAR=1
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4) 安装到 Zed 扩展目录
+# 4) Install into the Zed extension directory.
 # ---------------------------------------------------------------------------
-echo "【5/7】安装扩展文件到 Zed..."
+echo "[5/7] Install extension files into Zed..."
 mkdir -p "$ZED_EXT_DIR"
 INSTALL_DIR="${ZED_EXT_DIR}/httpyacclient"
-rm -rf "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR/grammars" "$INSTALL_DIR/lsp"
+INSTALL_STAGE="$(mktemp -d "$ZED_EXT_DIR/.httpyacclient.stage.XXXXXX")"
+mkdir -p "$INSTALL_STAGE/grammars" "$INSTALL_STAGE/lsp"
 
-cp extension.toml extension.wasm "$INSTALL_DIR/"
-cp -R languages "$INSTALL_DIR/"
-cp grammars/http.wasm "$INSTALL_DIR/grammars/"
+cp extension.toml extension.wasm "$INSTALL_STAGE/"
+cp -R languages "$INSTALL_STAGE/"
+cp grammars/http.wasm "$INSTALL_STAGE/grammars/"
 if [[ -d snippets ]]; then
-  cp -R snippets "$INSTALL_DIR/"
+  cp -R snippets "$INSTALL_STAGE/"
 fi
-cp target/release/httpyac-lsp "$INSTALL_DIR/lsp/httpyac-lsp"
-cp target/release/httpyac-run "$INSTALL_DIR/lsp/httpyac-run"
-chmod +x "$INSTALL_DIR/lsp/httpyac-lsp" "$INSTALL_DIR/lsp/httpyac-run"
+cp lsp/target/release/httpyac-lsp "$INSTALL_STAGE/lsp/httpyac-lsp"
+cp lsp/target/release/httpyac-run "$INSTALL_STAGE/lsp/httpyac-run"
+mkdir -p "$INSTALL_STAGE/lsp/httpyac-models"
+cp lsp/httpyac-models/httpyac-globals.d.ts "$INSTALL_STAGE/lsp/httpyac-models/httpyac-globals.d.ts"
+cp -R lsp/httpyac-models/src "$INSTALL_STAGE/lsp/httpyac-models/"
+chmod +x "$INSTALL_STAGE/lsp/httpyac-lsp" "$INSTALL_STAGE/lsp/httpyac-run"
 
 if [[ "$IS_MACOS" -eq 1 ]]; then
-  codesign --force --sign - "$INSTALL_DIR/lsp/httpyac-lsp" 2>/dev/null || true
-  codesign --force --sign - "$INSTALL_DIR/lsp/httpyac-run" 2>/dev/null || true
+  sign_macos_binary "$INSTALL_STAGE/lsp/httpyac-lsp"
+  sign_macos_binary "$INSTALL_STAGE/lsp/httpyac-run"
+fi
+
+if [[ ! -f "$INSTALL_STAGE/extension.wasm" || ! -f "$INSTALL_STAGE/extension.toml" \
+   || ! -f "$INSTALL_STAGE/grammars/http.wasm" || ! -x "$INSTALL_STAGE/lsp/httpyac-lsp" ]]; then
+  echo "  ERROR: Staged extension is incomplete; existing installation was preserved."
+  exit 1
+fi
+
+if [[ -e "$INSTALL_DIR" ]]; then
+  INSTALL_BACKUP="${INSTALL_DIR}.backup.$$"
+  mv "$INSTALL_DIR" "$INSTALL_BACKUP"
+fi
+if ! mv "$INSTALL_STAGE" "$INSTALL_DIR"; then
+  echo "  ERROR: Extension replacement failed; restoring the previous version."
+  exit 1
+fi
+INSTALL_STAGE=""
+if [[ -n "$INSTALL_BACKUP" && -d "$INSTALL_BACKUP" ]]; then
+  rm -rf "$INSTALL_BACKUP"
+  INSTALL_BACKUP=""
 fi
 
 mkdir -p "$LOCAL_BIN"
-cp target/release/httpyac-lsp "$LOCAL_BIN/httpyac-lsp"
-cp target/release/httpyac-run "$LOCAL_BIN/httpyac-run"
+cp lsp/target/release/httpyac-lsp "$LOCAL_BIN/httpyac-lsp"
+cp lsp/target/release/httpyac-run "$LOCAL_BIN/httpyac-run"
+mkdir -p "$LOCAL_BIN/httpyac-models"
+cp lsp/httpyac-models/httpyac-globals.d.ts "$LOCAL_BIN/httpyac-models/httpyac-globals.d.ts"
+cp -R lsp/httpyac-models/src "$LOCAL_BIN/httpyac-models/"
 chmod +x "$LOCAL_BIN/httpyac-lsp" "$LOCAL_BIN/httpyac-run"
 if [[ "$IS_MACOS" -eq 1 ]]; then
-  codesign --force --sign - "$LOCAL_BIN/httpyac-lsp" 2>/dev/null || true
-  codesign --force --sign - "$LOCAL_BIN/httpyac-run" 2>/dev/null || true
+  sign_macos_binary "$LOCAL_BIN/httpyac-lsp"
+  sign_macos_binary "$LOCAL_BIN/httpyac-run"
 fi
 
-# 校验关键文件是否到位
+# Verify that all required files are in place.
 if [[ -f "$INSTALL_DIR/extension.wasm" && -f "$INSTALL_DIR/extension.toml" \
    && -f "$INSTALL_DIR/grammars/http.wasm" && -x "$INSTALL_DIR/lsp/httpyac-lsp" \
    && -x "$LOCAL_BIN/httpyac-lsp" && -x "$LOCAL_BIN/httpyac-run" ]]; then
-  echo "  ✅ 扩展已安装 → $INSTALL_DIR"
-  echo "  ✅ LSP 已安装 → $LOCAL_BIN/httpyac-lsp"
-  echo "  ✅ 发送入口   → $LOCAL_BIN/httpyac-run  （▶ Send / 🌐 选环境）"
+  echo "  OK: Extension installed -> $INSTALL_DIR"
+  echo "  OK: LSP installed -> $LOCAL_BIN/httpyac-lsp"
+  echo "  OK: Send entry point -> $LOCAL_BIN/httpyac-run (Send / environment selector)"
   OK_EXT=1
 else
-  echo "  ❌ 扩展安装不完整，请检查上述路径"
+  echo "  ERROR: Extension installation is incomplete; check the paths above."
   exit 1
 fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5) 探测 httpyac / httpyac-lsp / vtsls
+# 5) Locate httpyac, httpyac-lsp, and vtsls.
 # ---------------------------------------------------------------------------
-echo "【6/7】探测 httpyac / httpyac-lsp / vtsls 路径..."
+echo "[6/7] Locate httpyac, httpyac-lsp, and vtsls..."
 HTTPYAC_PATH="$(command -v httpyac 2>/dev/null || true)"
 if [[ -z "$HTTPYAC_PATH" ]]; then
   HTTPYAC_PATH="httpyac"
   OK_HTTPYAC=0
-  print_manual_box "安装 httpyac CLI（否则无法发送请求）" \
-    "原因：当前 PATH 中找不到 httpyac 命令" \
+  print_manual_box "Install the httpyac CLI (required to send requests)" \
+    "Reason: the httpyac command is not in the current PATH." \
     "" \
-    "请执行：" \
+    "Run:" \
     "  npm install -g httpyac" \
     "" \
-    "然后验证：" \
+    "Then verify:" \
     "  which httpyac && httpyac --version"
-  WARNINGS+=("未找到 httpyac CLI")
-  MANUAL_REQUIRED+=("安装 httpyac：npm install -g httpyac")
+  WARNINGS+=("httpyac CLI was not found")
+  MANUAL_REQUIRED+=("Install httpyac: npm install -g httpyac")
 else
-  echo "  ✅ httpyac     = $HTTPYAC_PATH"
+  echo "  OK: httpyac     = $HTTPYAC_PATH"
   OK_HTTPYAC=1
 fi
 
@@ -385,15 +461,15 @@ if [[ -x "$LOCAL_BIN/httpyac-lsp" ]]; then
 elif command -v httpyac-lsp >/dev/null 2>&1; then
   LSP_PATH="$(command -v httpyac-lsp)"
 fi
-echo "  ✅ httpyac-lsp = $LSP_PATH"
+echo "  OK: httpyac-lsp = $LSP_PATH"
 if [[ -x "$LOCAL_BIN/httpyac-run" ]]; then
-  echo "  ✅ httpyac-run = $LOCAL_BIN/httpyac-run"
+  echo "  OK: httpyac-run = $LOCAL_BIN/httpyac-run"
 else
-  echo "  ⚠️  httpyac-run 未安装"
-  WARNINGS+=("httpyac-run 缺失，Send 按钮可能失败")
+  echo "  WARNING: httpyac-run is not installed"
+  WARNINGS+=("httpyac-run is missing; the Send button may fail")
 fi
 
-# vtsls = @vtsls/language-server（script 区内完整 TS/Node IntelliSense）
+# vtsls = @vtsls/language-server for full TypeScript/Node IntelliSense in script blocks.
 OK_VTSLS=0
 VTSLS_PATH="$(command -v vtsls 2>/dev/null || true)"
 if [[ -z "$VTSLS_PATH" ]]; then
@@ -411,26 +487,22 @@ if [[ -z "$VTSLS_PATH" ]]; then
 fi
 if [[ -z "$VTSLS_PATH" ]]; then
   VTSLS_PATH="vtsls"
-  print_manual_box "安装 vtsls（仅当 script 引擎选 vtsls 时需要）" \
-    "原因：当前 PATH 中找不到 vtsls（@vtsls/language-server）" \
-    "说明：默认 useBuiltinScriptCompletions=true 用内置 catalog，可不装 vtsls" \
-    "      若要用 child vtsls：useBuiltinScriptCompletions=false 或 scriptCompletionSource=\"vtsls\"" \
+  print_manual_box "Install vtsls (recommended for Node/JS script completions)" \
+    "Reason: vtsls (@vtsls/language-server) is not in the current PATH." \
+    "Details: vtsls provides official httpyac globals plus request/response and crypto/Node completions in script blocks." \
     "" \
-    "请执行：" \
+    "Run:" \
     "  npm install -g @vtsls/language-server" \
     "" \
-    "然后验证：" \
+    "Then verify:" \
     "  which vtsls && vtsls --version" \
     "" \
-    "装好后写入 settings（注释=可选值）：" \
-    "  \"vtslsCommand\": \"\$(which vtsls)\"   // 路径字符串" \
-    "  \"useBuiltinScriptCompletions\": false // true=内置 | false=vtsls（互斥）" \
-    "  \"scriptCompletionSource\": \"vtsls\"  // \"builtin\"|\"catalog\"|\"httpyac\" | \"vtsls\"|\"ts\"" \
-    "  \"vtslsEnabled\": true                 // true=允许 vtsls | false=强制 builtin"
-  WARNINGS+=("未找到 vtsls — 保持 useBuiltinScriptCompletions=true 即可用内置 catalog")
-  MANUAL_OPTIONAL+=("可选：npm i -g @vtsls/language-server，再设 useBuiltinScriptCompletions=false 用 vtsls")
+    "After installation, set this in settings:" \
+    "  \"vtslsCommand\": \"\$(which vtsls)\"   // Path string; enables mixed Node/JS completions when available"
+  WARNINGS+=("vtsls was not found; official models and Node/JS script completions are unavailable")
+  MANUAL_OPTIONAL+=("Install npm i -g @vtsls/language-server to enable official models and Node/JS script completions")
 else
-  echo "  ✅ vtsls      = $VTSLS_PATH"
+  echo "  OK: vtsls      = $VTSLS_PATH"
   OK_VTSLS=1
 fi
 echo ""
@@ -438,42 +510,42 @@ echo ""
 case ":${PATH}:" in
   *":${LOCAL_BIN}:"*) ;;
   *)
-    print_manual_box "把 ~/.local/bin 加入 PATH（推荐 / 发请求需要）" \
-      "原因：$LOCAL_BIN 不在当前 PATH 中" \
-      "说明：Zed 的 ▶ Send 会调用 httpyac-run，必须在 PATH 里能找到" \
+    print_manual_box "Add ~/.local/bin to PATH (recommended and required to send requests)" \
+      "Reason: $LOCAL_BIN is not in the current PATH." \
+      "Details: Zed Send invokes httpyac-run, which must be discoverable through PATH." \
       "" \
-      "请在 ~/.zshrc 或 ~/.bashrc 中加入一行：" \
+      "Add this line for your shell:" \
       "  export PATH=\"\$HOME/.local/bin:\$PATH\"" \
       "" \
-      "然后执行： source ~/.zshrc   （或重新开终端）" \
-      "再完全退出并重启 Zed"
-    WARNINGS+=("\$HOME/.local/bin 不在 PATH — Send 可能找不到 httpyac-run")
-    MANUAL_REQUIRED+=("PATH 增加 \$HOME/.local/bin 并重启 Zed（否则无环境按钮/发请求失败）")
+      "fish: fish_add_path \$HOME/.local/bin; zsh/bash: source ~/.zshrc or source ~/.bashrc" \
+      "Then fully quit and restart Zed."
+    WARNINGS+=("\$HOME/.local/bin is not in PATH; Send may not find httpyac-run")
+    MANUAL_REQUIRED+=("Add \$HOME/.local/bin to PATH and restart Zed, or Send may fail")
     ;;
 esac
 
 # ---------------------------------------------------------------------------
-# 6) settings.json（有注释则默认不覆盖）
+# 6) settings.json (do not overwrite comments by default).
 # ---------------------------------------------------------------------------
-echo "【7/7】处理 Zed settings.json..."
+echo "[7/7] Process Zed settings.json..."
 if [[ "${SKIP_ZED_SETTINGS:-0}" == "1" ]]; then
-  echo "  ⏭️  已设置 SKIP_ZED_SETTINGS=1，未修改配置文件"
-  OK_SETTINGS="已跳过（你指定了跳过）"
-  MANUAL_OPTIONAL+=("若需要可自行编辑 settings：$ZED_SETTINGS")
+  echo "  SKIPPED: SKIP_ZED_SETTINGS=1 is set; settings were not modified"
+  OK_SETTINGS="Skipped by request"
+  MANUAL_OPTIONAL+=("Edit settings manually if needed: $ZED_SETTINGS")
 elif [[ "${FORCE_ZED_SETTINGS:-0}" != "1" ]] && [[ -f "$ZED_SETTINGS" ]] && \
      grep -qE '^\s*//|/\*' "$ZED_SETTINGS" 2>/dev/null; then
-  print_manual_box "合并 Zed settings.json（本次未自动写入）" \
-    "原因：配置文件含 // 注释，自动写入会丢掉注释，故跳过" \
-    "文件：$ZED_SETTINGS" \
+  print_manual_box "Merge Zed settings.json (not written automatically)" \
+    "Reason: the configuration file contains // comments, and automatic writes would remove them." \
+    "File: $ZED_SETTINGS" \
     "" \
-    "说明：扩展本体已装好，不配 settings 通常也能用；" \
-    "      写入配置可固定 httpyac / LSP 绝对路径，更稳妥。" \
+    "Details: the extension is installed and usually works without settings;" \
+    "         configuration pins absolute httpyac and LSP paths for greater reliability." \
     "" \
-    "▼ 请打开该文件，把下方 JSON 片段合并进顶层 { } 中"
+    "Open this file and merge the JSON block below into the top-level { } object."
   print_manual_json_block "$ZED_SETTINGS"
-  OK_SETTINGS="未写入（有注释 → 需你手动合并）"
-  WARNINGS+=("settings 未自动写入")
-  MANUAL_OPTIONAL+=("手动合并 settings.json（见上方「需要你手动操作」框）")
+  OK_SETTINGS="Not written (comments require manual merge)"
+  WARNINGS+=("settings were not written automatically")
+  MANUAL_OPTIONAL+=("Manually merge settings.json using the manual action box above")
 else
   mkdir -p "$(dirname "$ZED_SETTINGS")"
   if command -v python3 >/dev/null 2>&1; then
@@ -482,7 +554,6 @@ else
       FORCE_ZED_SETTINGS="${FORCE_ZED_SETTINGS:-0}" \
       python3 - "$ZED_SETTINGS" <<'PY'
 import json, os, re, shutil, sys, time
-from copy import deepcopy
 
 path = sys.argv[1]
 httpyac = os.environ.get("HTTPYAC_PATH", "httpyac")
@@ -513,7 +584,6 @@ if existed:
 else:
     settings = {}
 
-before = deepcopy(settings)
 changed = []
 
 def setp(keys, value, *, force_update=False):
@@ -541,12 +611,20 @@ setp(["httpyac", "default_env"], "dev", force_update=False)
 setp(["lsp", "httpyac-lsp", "binary", "path"], lsp, force_update=True)
 setp(["lsp", "httpyac-lsp", "binary", "arguments"], [], force_update=False)
 setp(["lsp", "httpyac-lsp", "settings", "vtslsCommand"], vtsls, force_update=True)
-setp(["lsp", "httpyac-lsp", "settings", "vtslsEnabled"], True, force_update=False)
-# Script tips: builtin XOR vtsls — pure vtsls when binary found (shadow+jsconfig+@types/node)
-_use_vtsls = (ok_vtsls == 1)
-setp(["lsp", "httpyac-lsp", "settings", "useBuiltinScriptCompletions"], (not _use_vtsls), force_update=True)
-setp(["lsp", "httpyac-lsp", "settings", "scriptCompletionSource"], ("vtsls" if _use_vtsls else "builtin"), force_update=True)
-setp(["httpyac", "use_builtin_script_completions"], True, force_update=False)
+# Drop removed engine-toggle keys from older installs (always mixed now)
+for _dead in (
+    "useBuiltinScriptCompletions",
+    "scriptCompletionSource",
+    "use_builtin_script_completions",
+    "script_completion_source",
+    "vtslsEnabled",
+    "vtsls_enabled",
+):
+    try:
+        settings.get("lsp", {}).get("httpyac-lsp", {}).get("settings", {}).pop(_dead, None)
+        settings.get("httpyac", {}).pop(_dead, None)
+    except Exception:
+        pass
 
 if not changed:
     print("UP_TO_DATE")
@@ -568,59 +646,59 @@ PY
     )"
     case "$SET_OUT" in
       *SKIP_COMMENTS*)
-        print_manual_box "合并 Zed settings.json（检测到注释，未自动写入）" \
-          "文件：$ZED_SETTINGS" \
-          "▼ 请手动合并下方 JSON 片段"
+        print_manual_box "Merge Zed settings.json (comments detected; not written automatically)" \
+          "File: $ZED_SETTINGS" \
+          "Manually merge the JSON block below."
         print_manual_json_block "$ZED_SETTINGS"
-        OK_SETTINGS="未写入（有注释 → 需你手动合并）"
-        WARNINGS+=("settings 未自动写入")
-        MANUAL_OPTIONAL+=("手动合并 settings.json（见上方框）")
+        OK_SETTINGS="Not written (comments require manual merge)"
+        WARNINGS+=("settings were not written automatically")
+        MANUAL_OPTIONAL+=("Manually merge settings.json using the box above")
         ;;
       *PARSE_ERROR*)
-        print_manual_box "修复 settings.json 后重试" \
-          "原因：无法解析 $ZED_SETTINGS" \
-          "请检查 JSON/JSONC 语法，或手动加入 httpyac 相关配置"
+        print_manual_box "Fix settings.json and retry" \
+          "Reason: unable to parse $ZED_SETTINGS" \
+          "Check JSON/JSONC syntax or add the httpyac configuration manually."
         print_manual_json_block "$ZED_SETTINGS"
-        OK_SETTINGS="未写入（解析失败 → 需你手动处理）"
-        WARNINGS+=("settings 解析失败")
-        MANUAL_OPTIONAL+=("修复并合并 settings.json")
+        OK_SETTINGS="Not written (parse failure requires manual action)"
+        WARNINGS+=("settings parsing failed")
+        MANUAL_OPTIONAL+=("Fix and merge settings.json")
         ;;
       *UP_TO_DATE*)
-        echo "  ✅ 配置已是最新，无需写入（无需你操作）"
-        OK_SETTINGS="已就绪（无需改动）"
+        echo "  OK: settings are already up to date; no write is needed"
+        OK_SETTINGS="Ready (no changes needed)"
         ;;
       *MERGED:*)
         if [[ "$SET_OUT" == *BACKUP:* ]]; then
-          echo "  📦 已备份：$(echo "$SET_OUT" | tr ' ' '\n' | grep '^BACKUP:' | head -1 | cut -d: -f2-)"
+          echo "  Backup created: $(echo "$SET_OUT" | tr ' ' '\n' | grep '^BACKUP:' | head -1 | cut -d: -f2-)"
         fi
-        echo "  ✅ 已合并写入 settings.json（无重复 key，无需你再改）"
-        OK_SETTINGS="已写入（无需你操作）"
+        echo "  OK: merged into settings.json without duplicate keys"
+        OK_SETTINGS="Written (no further action needed)"
         if [[ "$SET_OUT" == *FORCE_NO_COMMENTS* ]]; then
-          echo "  ⚠️  强制覆盖：原文件中的 // 注释已丢失"
+          echo "  WARNING: forced overwrite removed existing // comments"
         fi
         ;;
       *)
         echo "  $SET_OUT"
-        OK_SETTINGS="已处理"
+        OK_SETTINGS="Processed"
         ;;
     esac
   else
-    print_manual_box "安装 python3 或手动改 settings" \
-      "原因：未找到 python3，无法自动合并配置" \
-      "文件：$ZED_SETTINGS"
+    print_manual_box "Install python3 or edit settings manually" \
+      "Reason: python3 was not found, so settings cannot be merged automatically." \
+      "File: $ZED_SETTINGS"
     print_manual_json_block "$ZED_SETTINGS"
-    OK_SETTINGS="未写入（无 python3 → 需你手动合并）"
-    WARNINGS+=("无 python3，settings 未改")
-    MANUAL_OPTIONAL+=("手动合并 settings.json 或安装 python3 后重跑")
+    OK_SETTINGS="Not written (python3 is required for automatic merge)"
+    WARNINGS+=("python3 is unavailable, so settings were not changed")
+    MANUAL_OPTIONAL+=("Manually merge settings.json or install python3 and run the script again")
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 最终结论
+# Final summary.
 # ---------------------------------------------------------------------------
 echo ""
 echo "=========================================="
-echo "           安装结果结论"
+echo "           Installation Summary"
 echo "=========================================="
 echo ""
 
@@ -631,45 +709,45 @@ CORE_OK=1
 [[ "$OK_EXT" -eq 1 ]]     || CORE_OK=0
 
 if [[ "$CORE_OK" -eq 1 ]]; then
-  echo "【结论】✅ 扩展安装成功"
+  echo "Result: Extension installation succeeded"
 else
-  echo "【结论】❌ 扩展安装失败（核心步骤有错误）"
+  echo "Result: Extension installation failed (a core step failed)"
 fi
 echo ""
-echo "  检查项："
-echo "  ├─ httpyac-lsp 编译     $([ "$OK_LSP" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
-echo "  ├─ WASM 扩展编译       $([ "$OK_WASM" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
-echo "  ├─ 语法文件            $([ "$OK_GRAMMAR" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
-echo "  ├─ 安装到 Zed 扩展目录 $([ "$OK_EXT" -eq 1 ] && echo '✅ 成功' || echo '❌ 失败')"
-echo "  ├─ httpyac CLI         $([ "$OK_HTTPYAC" -eq 1 ] && echo '✅ 已找到' || echo '⚠️  未找到（发请求前需安装）')"
-echo "  ├─ vtsls (script TS)   $([ "${OK_VTSLS:-0}" -eq 1 ] && echo '✅ 已找到' || echo '⚠️  未找到（script 完整补全需安装）')"
-echo "  └─ settings.json       $OK_SETTINGS"
+echo "  Checks:"
+echo "  - httpyac-lsp build:      $([ "$OK_LSP" -eq 1 ] && echo 'OK' || echo 'FAILED')"
+echo "  - WASM extension build:   $([ "$OK_WASM" -eq 1 ] && echo 'OK' || echo 'FAILED')"
+echo "  - Grammar file:           $([ "$OK_GRAMMAR" -eq 1 ] && echo 'OK' || echo 'FAILED')"
+echo "  - Zed extension install:  $([ "$OK_EXT" -eq 1 ] && echo 'OK' || echo 'FAILED')"
+echo "  - httpyac CLI:            $([ "$OK_HTTPYAC" -eq 1 ] && echo 'FOUND' || echo 'MISSING (install before sending requests)')"
+echo "  - vtsls (script TS):      $([ "${OK_VTSLS:-0}" -eq 1 ] && echo 'FOUND' || echo 'MISSING (install for full script completions)')"
+echo "  - settings.json:          $OK_SETTINGS"
 echo ""
-echo "  安装位置："
-echo "  ├─ 扩展：$INSTALL_DIR"
-echo "  ├─ LSP ：$LSP_PATH"
-echo "  ├─ httpyac：$HTTPYAC_PATH"
-echo "  └─ vtsls：$VTSLS_PATH"
+echo "  Installation paths:"
+echo "  - Extension: $INSTALL_DIR"
+echo "  - LSP:       $LSP_PATH"
+echo "  - httpyac:   $HTTPYAC_PATH"
+echo "  - vtsls:     $VTSLS_PATH"
 echo ""
 
 if [[ ${#WARNINGS[@]} -gt 0 ]]; then
-  echo "  注意事项："
+  echo "  Warnings:"
   for w in "${WARNINGS[@]}"; do
-    echo "  ⚠️  $w"
+    echo "  WARNING: $w"
   done
   echo ""
 fi
 
-# —— 需要你动手的清单（重点高亮）——
+# Manual action checklist.
 echo ""
-echo "${C_BG_RED}████████████████████████████████████████████████████████████████${C_RESET}"
-echo "${C_BG_RED}██  ✋ 需要你手动完成的事项（请逐项打勾）                        ██${C_RESET}"
-echo "${C_BG_RED}████████████████████████████████████████████████████████████████${C_RESET}"
+echo "${C_BG_RED}+----------------------------------------------------------------+${C_RESET}"
+echo "${C_BG_RED}| Manual actions to complete                                     |${C_RESET}"
+echo "${C_BG_RED}+----------------------------------------------------------------+${C_RESET}"
 echo ""
 HAS_MANUAL=0
 if [[ ${#MANUAL_REQUIRED[@]} -gt 0 ]]; then
   HAS_MANUAL=1
-  echo "${C_BG_YEL}  【必做】不处理可能影响发请求 / 使用  ${C_RESET}"
+  echo "${C_BG_YEL}  Required: skipping these may affect requests or usage. ${C_RESET}"
   local_i=1
   for item in "${MANUAL_REQUIRED[@]}"; do
     echo "    ${C_RED}${C_BOLD}$local_i.${C_RESET} ${C_BOLD}$item${C_RESET}"
@@ -679,7 +757,7 @@ if [[ ${#MANUAL_REQUIRED[@]} -gt 0 ]]; then
 fi
 if [[ ${#MANUAL_OPTIONAL[@]} -gt 0 ]]; then
   HAS_MANUAL=1
-  echo "${C_BG_CYN}  【选做】不处理一般也能用，建议做  ${C_RESET}"
+  echo "${C_BG_CYN}  Optional: the extension usually works without these, but they are recommended. ${C_RESET}"
   local_i=1
   for item in "${MANUAL_OPTIONAL[@]}"; do
     echo "    ${C_CYN}$local_i.${C_RESET} $item"
@@ -687,33 +765,40 @@ if [[ ${#MANUAL_OPTIONAL[@]} -gt 0 ]]; then
   done
   echo ""
 fi
-# 重启 Zed 始终是必做（装完扩展必须）
+# Restarting Zed is always required after installing the extension.
 if [[ "$CORE_OK" -eq 1 ]]; then
   HAS_MANUAL=1
-  echo "${C_BG_YEL}  【必做】安装完成后请立刻  ${C_RESET}"
-  echo "    ${C_RED}${C_BOLD}1.${C_RESET} ${C_BOLD}完全退出 Zed（macOS: Cmd+Q，不要只关窗口）再重新打开${C_RESET}"
-  echo "    ${C_RED}${C_BOLD}2.${C_RESET} ${C_BOLD}打开 examples/basic.http → 点请求左侧 ▶ Send 试发${C_RESET}"
+  echo "${C_BG_YEL}  Required immediately after installation: ${C_RESET}"
+  echo "    ${C_RED}${C_BOLD}1.${C_RESET} ${C_BOLD}Fully quit Zed (macOS: Cmd+Q, not only the window) and reopen it.${C_RESET}"
+  echo "    ${C_RED}${C_BOLD}2.${C_RESET} ${C_BOLD}Open examples/basic.http and test Send from the left side of a request.${C_RESET}"
   if [[ "$OK_HTTPYAC" -eq 1 ]]; then
-    echo "    ${C_DIM}3.${C_RESET} （可选）examples/environments.http → 点 🌐 Env:* 切换环境"
+    echo "    ${C_DIM}3.${C_RESET} (Optional) Open examples/environments.http and use Env:* to switch environments."
   fi
   echo ""
 fi
 if [[ "$HAS_MANUAL" -eq 0 ]]; then
-  echo "  （当前没有额外手动项）"
+  echo "  No additional manual actions are required."
   echo ""
 fi
 
-if [[ "$CORE_OK" -eq 1 ]]; then
+if [[ "$CORE_OK" -eq 1 && "$OK_HTTPYAC" -eq 1 ]]; then
   echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo "${C_GRN}${C_BOLD}【结论】✅ 扩展本体安装成功${C_RESET}"
-  echo "         请完成上面 ${C_YEL}${C_BOLD}黄底/红底${C_RESET} 标出的「必做」项后再使用。"
+  echo "${C_GRN}${C_BOLD}Result: Extension installation succeeded${C_RESET}"
+  echo "         Complete the required actions highlighted in yellow or red before use."
   echo "${C_BG_YEL}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
   echo ""
   exit 0
+elif [[ "$CORE_OK" -eq 1 ]]; then
+  echo "${C_BG_RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
+  echo "${C_YEL}${C_BOLD}Result: Extension is installed, but the Send runtime is not ready${C_RESET}"
+  echo "         Install httpyac and run this script again, or ensure Zed can find httpyac through PATH."
+  echo "${C_BG_RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
+  echo ""
+  exit 2
 else
   echo "${C_BG_RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo "${C_RED}${C_BOLD}【结论】❌ 安装未完成${C_RESET}"
-  echo "         请根据上方 ❌ 与「需要你手动操作」排查后重试。"
+  echo "${C_RED}${C_BOLD}Result: Installation did not complete${C_RESET}"
+  echo "         Review the errors and manual actions above, then retry."
   echo "${C_BG_RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
   echo ""
   exit 1

@@ -8,8 +8,8 @@ impl HttpyacClientExtension {
     /// Resolve httpyac-lsp binary, in priority order:
     /// 1) user settings `lsp.httpyac-lsp.binary.path`
     /// 2) PATH (`worktree.which`)
-    /// 3) extension-bundled `lsp/httpyac-lsp` (Zed sets cwd to the extension dir)
-    /// 4) `$HOME/.local/bin/httpyac-lsp`
+    /// 3) extension-bundled `lsp/httpyac-lsp[.exe]` (Zed sets cwd to the extension dir)
+    /// 4) platform local bin (`$HOME/.local/bin` or `%LOCALAPPDATA%`)
     fn resolve_lsp_binary(
         &self,
         language_server_id: &LanguageServerId,
@@ -64,17 +64,20 @@ impl HttpyacClientExtension {
 
         // 3) bundled next to extension.wasm (cwd = extension install dir)
         if let Ok(cwd) = std::env::current_dir() {
-            for rel in ["lsp/httpyac-lsp", "httpyac-lsp"] {
+            for rel in [
+                "lsp/httpyac-lsp",
+                "lsp/httpyac-lsp.exe",
+                "httpyac-lsp",
+                "httpyac-lsp.exe",
+            ] {
                 let candidate = cwd.join(rel);
                 if candidate.is_file() {
                     return Ok((candidate.to_string_lossy().to_string(), vec![], env));
                 }
             }
-            // Also try absolute from known install layouts
-            let _ = PathBuf::from(&cwd);
         }
 
-        // 4) ~/.local/bin
+        // 4) platform local install locations
         let home = env
             .iter()
             .find(|(k, _)| k == "HOME")
@@ -86,18 +89,28 @@ impl HttpyacClientExtension {
             })
             .unwrap_or_else(|| ".".to_string());
 
-        let local = format!(
-            "{}/.local/bin/httpyac-lsp",
-            home.trim_end_matches(['/', '\\'])
-        );
-        if std::path::Path::new(&local).is_file() {
-            return Ok((local, vec![], env));
+        let home_dir = PathBuf::from(home.trim_end_matches(['/', '\\']));
+        let local = home_dir.join(".local/bin/httpyac-lsp");
+        if local.is_file() {
+            return Ok((local.to_string_lossy().to_string(), vec![], env));
+        }
+
+        let windows_local = home_dir
+            .join("AppData")
+            .join("Local")
+            .join("httpyacclient")
+            .join("bin")
+            .join("httpyac-lsp.exe");
+        if windows_local.is_file() {
+            return Ok((windows_local.to_string_lossy().to_string(), vec![], env));
         }
 
         Err(format!(
-            "httpyac-lsp not found. Install with ./install_to_zed.sh \
+            "httpyac-lsp not found. Install with ./install_to_zed.sh or .\\install_to_zed.ps1 \
              or set lsp.httpyac-lsp.binary.path in settings.json \
-             (tried PATH, extension lsp/, {local})"
+             (tried PATH, extension lsp/, {}, {})",
+            local.display(),
+            windows_local.display(),
         ))
     }
 }
@@ -126,11 +139,23 @@ impl zed::Extension for HttpyacClientExtension {
         worktree: &zed::Worktree,
     ) -> Result<Option<serde_json::Value>> {
         let mut map = serde_json::Map::new();
-        // Seed vtsls path for script-region proxy
+        // Forward user lsp.httpyac-lsp.settings + seed vtsls path for mixed completions
         if let Ok(settings) = LspSettings::for_worktree(language_server_id.as_ref(), worktree) {
             if let Some(s) = settings.settings {
                 if let Some(obj) = s.as_object() {
                     for (k, v) in obj {
+                        // Drop removed exclusive-engine keys if present in old settings
+                        if matches!(
+                            k.as_str(),
+                            "useBuiltinScriptCompletions"
+                                | "use_builtin_script_completions"
+                                | "scriptCompletionSource"
+                                | "script_completion_source"
+                                | "vtslsEnabled"
+                                | "vtsls_enabled"
+                        ) {
+                            continue;
+                        }
                         map.insert(k.clone(), v.clone());
                     }
                 }
@@ -139,46 +164,6 @@ impl zed::Extension for HttpyacClientExtension {
         if !map.contains_key("vtslsCommand") && !map.contains_key("vtsls_command") {
             if let Some(v) = worktree.which("vtsls") {
                 map.insert("vtslsCommand".into(), serde_json::Value::String(v));
-            }
-        }
-        if !map.contains_key("vtslsEnabled") {
-            map.insert("vtslsEnabled".into(), serde_json::Value::Bool(true));
-        }
-        // Default to pure vtsls (user request) when vtsls available; otherwise safe builtin
-        if !map.contains_key("useBuiltinScriptCompletions")
-            && !map.contains_key("scriptCompletionSource")
-            && map.contains_key("vtslsCommand")
-        {
-            map.insert(
-                "useBuiltinScriptCompletions".into(),
-                serde_json::Value::Bool(false),
-            );
-            map.insert(
-                "scriptCompletionSource".into(),
-                serde_json::Value::String("vtsls".into()),
-            );
-        } else if !map.contains_key("useBuiltinScriptCompletions")
-            && !map.contains_key("scriptCompletionSource")
-        {
-            // Force vtsls when available (pure vtsls path)
-            if map.contains_key("vtslsCommand") && map.get("vtslsCommand").unwrap().as_str().is_some_and(|s| !s.is_empty()) {
-                map.insert(
-                    "useBuiltinScriptCompletions".into(),
-                    serde_json::Value::Bool(false),
-                );
-                map.insert(
-                    "scriptCompletionSource".into(),
-                    serde_json::Value::String("vtsls".into()),
-                );
-            } else {
-                map.insert(
-                    "useBuiltinScriptCompletions".into(),
-                    serde_json::Value::Bool(true),
-                );
-                map.insert(
-                    "scriptCompletionSource".into(),
-                    serde_json::Value::String("builtin".into()),
-                );
             }
         }
         if map.is_empty() {

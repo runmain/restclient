@@ -31,7 +31,7 @@ Fully quit and restart Zed after install.
 3. **httpyac-run** only assembles args / env, then runs httpyac.
 4. **Env switch only updates `activeEnv` in `http-client.env.json`** — no extra sidecar files.
 5. **No machine-specific absolute paths** in source; use `which`, `$HOME`, `$XDG_CONFIG_HOME`.
-6. **`install_to_zed.sh` must work on macOS and Linux**; `codesign` only on macOS.
+6. **`install_to_zed.sh` must work on macOS and Linux**, and **`install_to_zed.ps1` must install on Windows**; `codesign` only on macOS.
 7. Keep install UX clear: highlight steps the user must do manually.
 
 ## Layout
@@ -51,7 +51,8 @@ httpyacclient/
 ├── examples/
 ├── docs/
 ├── extension.toml
-└── install_to_zed.sh
+├── install_to_zed.sh
+└── install_to_zed.ps1
 ```
 
 ## Style

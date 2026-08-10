@@ -31,12 +31,13 @@ Send path:
 
 | What you type | Who completes it |
 |---------------|------------------|
-| `Host`, `{{base_url}}`, `client.global`, `response.` | **httpyac-lsp** (this extension) |
-| JS keywords / `JSON.` / `require('crypto')` module names in scripts | **httpyac-lsp** (curated list, not full Node types) |
-| Script `request.` / `client.` (thin hints) | **httpyac-lsp** only on HTTP |
+| `Host`, `{{base_url}}`, HTTP-specific entries | **httpyac-lsp** (this extension) |
+| 11 个 httpyac 全局变量及 `request.` / `response.` 类型提示 | **child vtsls** + `lsp/httpyac-models` official snapshot |
+| JS / Node (`crypto`, `JSON`, …) in scripts | **child vtsls** |
+| Script `request.` / `client.` | **child vtsls** inside script islands |
 | **Full** Node/`crypto` in **`.js`** (Zed-managed vtsls) | Open real modules — [docs/VTSLS-SCRIPTS.md](docs/VTSLS-SCRIPTS.md) |
 | **Full** TS IntelliSense **inside** `.http` `{{ }}` scripts | Child **vtsls** via httpyac-lsp — install `@vtsls/language-server`, set `httpyac.vtsls_command` ([docs/VTSLS-MULTI-LSP-REVIEW.md](docs/VTSLS-MULTI-LSP-REVIEW.md)) |
-| **Builtin + user script modules** (`request`/`client`/`crypto`/… as JS; user `.script` overrides) | [docs/SCRIPT-EXT.md](docs/SCRIPT-EXT.md) + `lsp/builtin_script/` |
+| **Official httpyac globals** + child **vtsls** (Node/JS/TS and user modules) | [docs/SCRIPT-EXT.md](docs/SCRIPT-EXT.md) |
 | **Review / crash-hardening notes** | [docs/REVIEW-SCRIPT-COMPLETIONS.md](docs/REVIEW-SCRIPT-COMPLETIONS.md) |
 | JSON body highlighting | Tree-sitter injections (bodies only; no JS inject in scripts) |
 | Running the script | **httpyac CLI** |
@@ -61,7 +62,9 @@ rustup target add wasm32-wasip2
 
 ---
 
-## Install (macOS / Linux)
+## Install
+
+### macOS / Linux
 
 ```bash
 cd httpyacclient
@@ -70,19 +73,37 @@ cd httpyacclient
 
 Then:
 
-1. Ensure `export PATH="$HOME/.local/bin:$PATH"`
+1. Ensure `export PATH="$HOME/.local/bin:$PATH"` (fish: `fish_add_path ~/.local/bin`)
 2. **Fully quit Zed** (Cmd+Q on macOS — not just close the window) and reopen
 3. Open `examples/basic.http` and try Send
+
+### Windows
+
+```powershell
+cd httpyacclient
+Set-ExecutionPolicy -Scope Process Bypass
+.\install_to_zed.ps1
+```
+
+The installer builds the native `.exe` files, installs the extension under `%LOCALAPPDATA%`, and adds its runner directory to the user `PATH`. Fully quit and reopen Zed before testing Send.
+
+For a Linux container, only install through bind mounts to a **Linux host with the same CPU architecture**. Set both target directories explicitly; a Linux container cannot install macOS binaries:
+
+```bash
+ZED_EXT_DIR=/mounted/zed/extensions/installed \
+HTTPYAC_LOCAL_BIN=/mounted/local/bin \
+./install_to_zed.sh
+```
 
 More detail: [docs/SETUP.md](docs/SETUP.md).
 
 ### Platform paths
 
-| | macOS | Linux |
-|-|-------|-------|
-| Extension | `~/Library/Application Support/Zed/extensions/installed/httpyacclient` | `~/.config/zed/extensions/installed/httpyacclient` |
-| Settings | **`~/.config/zed/settings.json`** | Same |
-| Binaries | `~/.local/bin/httpyac-lsp`, `httpyac-run` | Same |
+| | macOS | Linux | Windows |
+|-|-------|-------|---------|
+| Extension | `~/Library/Application Support/Zed/extensions/installed/httpyacclient` | `${XDG_DATA_HOME:-$HOME/.local/share}/zed/extensions/installed/httpyacclient` | `%LOCALAPPDATA%\Zed\extensions\installed\httpyacclient` |
+| Settings | **`~/.config/zed/settings.json`** | `~/.config/zed/settings.json` | `%APPDATA%\Zed\settings.json` |
+| Binaries | `~/.local/bin/httpyac-lsp`, `httpyac-run` | Same | `%LOCALAPPDATA%\httpyacclient\bin\*.exe` |
 
 ### Install script flags
 
@@ -90,6 +111,7 @@ More detail: [docs/SETUP.md](docs/SETUP.md).
 SKIP_ZED_SETTINGS=1 ./install_to_zed.sh    # never touch settings.json
 FORCE_ZED_SETTINGS=1 ./install_to_zed.sh   # force-merge settings (// comments lost; backup created)
 NO_COLOR=1 ./install_to_zed.sh             # disable ANSI colors
+ZED_EXT_DIR=/path/to/extensions HTTPYAC_LOCAL_BIN=/path/to/bin ./install_to_zed.sh # container bind mounts
 ```
 
 ---
@@ -162,10 +184,7 @@ Optional. Works without it if PATH is correct.
         "arguments": []
       },
       "settings": {
-        "vtslsCommand": "/absolute/path/to/vtsls",
-        "vtslsEnabled": true,
-        "useBuiltinScriptCompletions": true,
-        "scriptCompletionSource": "builtin"
+        "vtslsCommand": "/absolute/path/to/vtsls"
       }
     }
   },
@@ -192,14 +211,10 @@ which vtsls && vtsls --version
 |-----|---------|
 | `httpyac.command` | Path to httpyac CLI |
 | `httpyac.lsp_command` | Path to httpyac-lsp |
-| `httpyac.vtsls_command` | Path to `vtsls` binary (only used when script engine = vtsls) |
-| `httpyac.use_builtin_script_completions` | `true` (default) = **builtin catalog only** in `{{ }}`; `false` = **vtsls only** |
+| `httpyac.vtsls_command` | Path to `vtsls` binary (required for script and official httpyac model completion) |
 | `httpyac.default_env` | Docs/default name; runtime uses JSON `activeEnv` |
 | `lsp.httpyac-lsp.binary.path` | Binary Zed uses to start the LSP |
 | `lsp.httpyac-lsp.settings.vtslsCommand` | Same as `httpyac.vtsls_command` |
-| `lsp.httpyac-lsp.settings.useBuiltinScriptCompletions` | **Mutex** with vtsls: `true` → catalog, `false` → child vtsls (not both) |
-| `lsp.httpyac-lsp.settings.scriptCompletionSource` | `"builtin"` \| `"vtsls"` (same choice, explicit) |
-| `lsp.httpyac-lsp.settings.vtslsEnabled` | `false` forces builtin even if source is vtsls |
 | `languages.HTTP.language_servers` | Must include **only** `httpyac-lsp` (do **not** add Zed’s `vtsls` on HTTP) |
 | `languages.HTTP.completions.words` | `fallback` = word list only if LSP has no results (avoids “Hello” hiding **Host**) |
 | `languages.HTTP.completions.words_min_length` | Min chars for word completions (use ≥3) |
